@@ -1,7 +1,7 @@
 {
   "name": "line-fortune-bot",
   "version": "1.0.0",
-  "description": "LINE fortune-telling bot on Render",
+  "description": "LINE fortune bot with GPT-5 on Render",
   "main": "index.js",
   "type": "module",
   "scripts": { "start": "node index.js" },
