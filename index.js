@@ -1,27 +1,42 @@
 import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 
+const app = express();
+
 const config = {
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
+  channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
 const client = new Client(config);
-const app = express();
 
 app.post("/webhook", middleware(config), async (req, res) => {
-  const events = req.body.events;
-  await Promise.all(events.map(handleEvent));
-  res.sendStatus(200);
+  try {
+    const events = req.body.events;
+    console.log("Received events:", events);
+
+    // 各イベントに対応
+    for (const event of events) {
+      if (event.type === "message" && event.message.type === "text") {
+        const userMessage = event.message.text;
+        const replyText = `🔮占いBOTより\nあなたのメッセージ：「${userMessage}」を受け取りました✨`;
+
+        await client.replyMessage(event.replyToken, {
+          type: "text",
+          text: replyText,
+        });
+      }
+    }
+
+    res.status(200).end();
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).end();
+  }
 });
 
-async function handleEvent(event) {
-  if (event.type !== "message" || event.message.type !== "text") return;
-
-  const userMessage = event.message.text;
-  const replyText = `🔮占いBOT：あなたのメッセージ「${userMessage}」を受け取りました✨\nもう少し詳しくお聞かせください。`;
-
-  await client.replyMessage(event.replyToken, { type: "text", text: replyText });
-}
-
-app.listen(process.env.PORT || 3000, () => console.log("Bot is running"));
+// Renderがポートを自動で割り当てる
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
