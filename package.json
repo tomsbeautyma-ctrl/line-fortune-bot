@@ -1,12 +1,11 @@
 {
   "name": "line-fortune-bot",
   "version": "1.0.0",
-  "description": "LINE fortune-telling bot using Render",
+  "description": "LINE fortune-telling bot on Render",
   "main": "index.js",
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "@line/bot-sdk": "^7.5.2",
     "express": "^4.19.2"
