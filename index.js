@@ -138,3 +138,16 @@ function fallbackReply() {
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on ${port}`));
 
+// 追加：LLMヘルスチェック（テスト後に消してOK）
+app.get("/ping-llm", async (_, res) => {
+  try {
+    const msg = await generateWithOpenAI("テスト鑑定を1文で。", []);
+    if (msg) return res.status(200).send("LLM ok: " + msg.slice(0, 60));
+    return res.status(500).send("LLM ng (fallback)");
+  } catch (e) {
+    return res.status(500).send("LLM error: " + (e.message || e));
+  }
+});
+
+
+
