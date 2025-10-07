@@ -126,7 +126,7 @@ function buildPrompt({ name, topic, detail, history }) {
   return `あなたは優しく誠実なプロ占い師。会話の流れを踏まえ、結論先出し＋根拠＋具体アクションで返答する。
 出力ルール:
 - 見出し: 「結論」「理由」「アクション」「注意点」「ひとこと励まし」
-- 文字数: 320〜520字、敬体。断定しすぎない。
+- 文字数: 300字、敬体。断定しすぎない。
 - テーマ: ${topic}。${flavor}
 - NG: 医療/法律/投資の確約、恐怖を煽る表現、個人攻撃
 
@@ -142,12 +142,13 @@ ${recent || "（初回）"}
 // ---- OpenAI（GPT） ----
 async function generateWithOpenAI(prompt, history) {
   const apiKey = process.env.OPENAI_API_KEY;
-  const model = process.env.MODEL || "gpt-4o-mini";
+  const model = process.env.MODEL || "gpt-5";
   if (!apiKey) return null;
 
   try {
     const messages = [
-      { role: "system", content: "あなたは温かく実務的な占い師。倫理に従い、安心感と具体性を両立させる。" },
+     { role: "system", content:
+  "あなたは日本語で鑑定するプロ占い師『りゅうせい』。タロット/オーラ/星の比喩を交え、結論→理由→行動→注意→励ましの順で300〜500字で返答。断定しすぎず、優しく、実行可能な提案を必ず入れる。" }
       ...history.slice(-6).map(m => ({ role: m.role, content: m.content })),
       { role: "user", content: prompt },
     ];
@@ -173,9 +174,10 @@ function convoFallback(topic, detail, history) {
     return `ありがとうございます。要点は「${(detail || "詳細") }」ですね。\n\n【結論】焦らず整えるほど運気は素直に伸びます。\n【理由】足元を固めるほど、選択肢の質が上がる流れ。\n【アクション】今日1つだけ、小さな行動（連絡・整理・メモ化）を終わらせましょう。\n【注意点】情報の取り込み過ぎ。判断は翌朝に回すと冴えます。\n【ひとこと励まし】今のペースで十分。丁寧さが未来の近道です。`;
   }
   // 初回などは軽い鑑定テンプレ
-  return `【結論】流れは静かに上向き。小さな整えが成果に直結します。\n【理由】過去の積み重ねが評価されやすい時期。\n【アクション】今日の優先3タスクを書き出し、1つだけ完了させる。\n【注意点】夜更かしと衝動決断は回避。\n【ひとこと励まし】一歩ずつで大丈夫。運は味方しています。`;
+  return ``;
 }
 
 // 起動
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on ${port}`));
+
