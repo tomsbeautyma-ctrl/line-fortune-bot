@@ -29,6 +29,61 @@ app.get("/env", (_, res) => {
     OPENAI: !!process.env.OPENAI_API_KEY,
   });
 });
+// --- STORES注文確認関数 ---
+async function verifySubscription(email) {
+  try {
+    const res = await fetch("https://api.stores.jp/v1/orders", {
+      headers: { Authorization: `Bearer ${process.env.STORES_API_KEY}` }
+    });
+    const data = await res.json();
+    return data.orders?.some(order =>
+      order.email === email &&
+      order.status === "paid" &&
+      order.title.includes("定期鑑定")
+    );
+  } catch (e) {
+    console.error("STORES verify error:", e);
+    return false;
+    // --- 定期プランチェック機能 ---
+async function checkPlanAndReply(event, userId, text) {
+  if (text.includes("定期プラン開始")) {
+    try {
+      const profile = await client.getProfile(userId);
+      const email = profile?.email || ""; // STORES購入時のメール想定
+      const valid = await verifySubscription(email);
+
+      if (!valid) {
+        await client.replyMessage(event.replyToken, {
+          type: "text",
+          text:
+            "⚠️ この機能は定期鑑定プラン（月額3,000円）ご契約者限定です🌙\n" +
+            "ご購入はこちらから💫\n" +
+            "👉 https://yourshop.stores.jp"
+        });
+        return false; // 鑑定を実行しない
+      }
+
+      await client.replyMessage(event.replyToken, {
+        type: "text",
+        text:
+          "🌕ご契約が確認できました！\n" +
+          "本日もあなたの運気を鑑定いたします🔮✨"
+      });
+      return true; // OK
+    } catch (e) {
+      console.error("checkPlanAndReply error:", e);
+      await client.replyMessage(event.replyToken, {
+        type: "text",
+        text: "システムエラーが発生しました。少し時間をおいて再試行してください。"
+      });
+      return false;
+    }
+  }
+  return null; // 「定期プラン開始」以外のメッセージならスルー
+}
+
+  }
+}
 
 // Webhook 受信
 app.post("/webhook", middleware(config), async (req, res) => {
@@ -44,6 +99,8 @@ app.post("/webhook", middleware(config), async (req, res) => {
 
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
+const planCheck = await checkPlanAndReply(event, userId, text);
+if (planCheck !== null) return; // 定期プランメッセージならここで終了
 
   const userId = event.source.userId;
   const text = (event.message.text || "").trim();
@@ -148,6 +205,7 @@ app.get("/ping-llm", async (_, res) => {
     return res.status(500).send("LLM error: " + (e.message || e));
   }
 });
+
 
 
 
