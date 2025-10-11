@@ -1,91 +1,64 @@
-// index.js — 会話できる占いLINE Bot（履歴メモリ + GPT）
+// index.js — LINE占いBot（3プラン対応：お試し/1日無制限/月額定期）
 
 import express from "express";
 import fetch from "node-fetch";
+import dayjs from "dayjs";
 import { Client, middleware } from "@line/bot-sdk";
+
+/* ====== 環境変数 ======
+LINE_ACCESS_TOKEN: LINE長期アクセストークン
+LINE_CHANNEL_SECRET: LINEチャネルシークレット
+OPENAI_API_KEY: OpenAI APIキー
+MODEL: gpt-4o-mini（推奨。なければデフォルト使用）
+STORE_URL: STORESの商品一覧やLPのURL（未設定でも動作）
+===================== */
 
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
-
-if (!config.channelAccessToken || !config.channelSecret) {
-  console.error("LINE環境変数が不足しています。");
-}
+const MODEL = process.env.MODEL || "gpt-4o-mini";
+const STORE_URL = process.env.STORE_URL || "https://your-stores.example.com/";
 
 const app = express();
 const client = new Client(config);
 
-// ---- 会話メモリ（簡易/プロセス内） ----
-const sessions = new Map(); // userId -> [{role, content}]
-const MAX_TURNS = 12;
+/* ==========
+  簡易DB（プロセス内）
+  本番で永続化したい場合は Redis / Firestore などに置換してください。
+============= */
+const sessions = new Map();   // userId -> [{role, content}]
+const users = new Map();      // userId -> { plan, expireAt, trialConsumed }
+const MAX_TURNS = 10;
 
-// ヘルスチェック
+// プラン種別
+const PLAN = {
+  NONE: "none",
+  TRIAL: "trial",        // お試し1回
+  UNLIMITED: "unlimited",// 1日無制限
+  MONTHLY: "monthly"     // 月額定期
+};
+
+// ============ ヘルス系 ===============
 app.get("/health", (_, res) => res.status(200).send("healthy"));
 app.get("/", (_, res) => res.status(200).send("OK"));
-app.get("/env", (_, res) => {
-  res.json({
-    MODEL: process.env.MODEL || "gpt-4o-mini",
-    OPENAI: !!process.env.OPENAI_API_KEY,
-  });
-});
-// --- STORES注文確認関数 ---
-async function verifySubscription(email) {
+app.get("/env", (_, res) => res.json({
+  MODEL,
+  OPENAI: !!process.env.OPENAI_API_KEY,
+  STORE_URL
+}));
+
+// LLM疎通テスト（必要なら）
+app.get("/ping-llm", async (_, res) => {
   try {
-    const res = await fetch("https://api.stores.jp/v1/orders", {
-      headers: { Authorization: `Bearer ${process.env.STORES_API_KEY}` }
-    });
-    const data = await res.json();
-    return data.orders?.some(order =>
-      order.email === email &&
-      order.status === "paid" &&
-      order.title.includes("定期鑑定")
-    );
+    const msg = await generateWithOpenAI("テスト鑑定を一文で。", []);
+    res.status(200).send(msg ? `LLM ok: ${msg.slice(0,60)}` : "LLM fallback");
   } catch (e) {
-    console.error("STORES verify error:", e);
-    return false;
-    // --- 定期プランチェック機能 ---
-async function checkPlanAndReply(event, userId, text) {
-  if (text.includes("定期プラン開始")) {
-    try {
-      const profile = await client.getProfile(userId);
-      const email = profile?.email || ""; // STORES購入時のメール想定
-      const valid = await verifySubscription(email);
-
-      if (!valid) {
-        await client.replyMessage(event.replyToken, {
-          type: "text",
-          text:
-            "⚠️ この機能は定期鑑定プラン（月額3,000円）ご契約者限定です🌙\n" +
-            "ご購入はこちらから💫\n" +
-            "👉 https://yourshop.stores.jp"
-        });
-        return false; // 鑑定を実行しない
-      }
-
-      await client.replyMessage(event.replyToken, {
-        type: "text",
-        text:
-          "🌕ご契約が確認できました！\n" +
-          "本日もあなたの運気を鑑定いたします🔮✨"
-      });
-      return true; // OK
-    } catch (e) {
-      console.error("checkPlanAndReply error:", e);
-      await client.replyMessage(event.replyToken, {
-        type: "text",
-        text: "システムエラーが発生しました。少し時間をおいて再試行してください。"
-      });
-      return false;
-    }
+    res.status(500).send("LLM error: " + (e.message || e));
   }
-  return null; // 「定期プラン開始」以外のメッセージならスルー
-}
+});
 
-  }
-}
-
-// Webhook 受信
+// ============ Webhook ============
 app.post("/webhook", middleware(config), async (req, res) => {
   try {
     const events = req.body?.events ?? [];
@@ -99,89 +72,216 @@ app.post("/webhook", middleware(config), async (req, res) => {
 
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
-const planCheck = await checkPlanAndReply(event, userId, text);
-if (planCheck !== null) return; // 定期プランメッセージならここで終了
 
   const userId = event.source.userId;
   const text = (event.message.text || "").trim();
   console.log("LINE msg:", userId, text);
 
-  // ---- コマンド ----
-  if (["/reset","リセット","reset"].includes(text)) {
-    sessions.delete(userId);
-    return client.replyMessage(event.replyToken, { type: "text", text: "履歴をリセットしました。何を占いますか？" });
+  // --- 初期化 ---
+  if (!users.has(userId)) {
+    users.set(userId, { plan: PLAN.NONE, expireAt: 0, trialConsumed: false });
   }
-  if (["/menu","メニュー","help","？","?"].includes(text)) {
-    return client.replyMessage(event.replyToken, { type: "text", text:
-      "🔮 占いメニュー\n・総合鑑定\n・恋愛/復縁/片想い\n・仕事/転職\n・金運\n・健康/生活リズム\n\n※「リセット」で履歴消去" });
+  const profileName = await safeName(userId);
+
+  // --- コマンド ---
+  // メニュー
+  if (["メニュー","menu","/menu","はじめる","help","？","?"].includes(text)) {
+    return reply(event, menuText());
+  }
+  // 状態確認
+  if (["/plan","プラン","状態","ステータス"].includes(text)) {
+    return reply(event, planStatusText(userId));
+  }
+  // 履歴リセット
+  if (["リセット","/reset","reset"].includes(text)) {
+    sessions.delete(userId);
+    return reply(event, "会話履歴をリセットしました。占い内容をどうぞ。");
   }
 
-  // ---- 履歴更新 ----
+  // --- STORES購入後の合言葉（文言は商品説明に明記） ---
+  // 例）「購入完了 お試し」「購入完了 無制限」「購入完了 定期」
+  if (/購入完了/.test(text)) {
+    const u = users.get(userId);
+    if (/お試し|試し|1回/.test(text)) {
+      u.plan = PLAN.TRIAL;
+      u.expireAt = 0;
+      return reply(event, "🪄 お試し1回占い（¥500）を有効化しました。質問を1件どうぞ。");
+    }
+    if (/無制限|1日|当日/.test(text)) {
+      u.plan = PLAN.UNLIMITED;
+      u.expireAt = dayjs().endOf("day").valueOf(); // 今日の23:59まで
+      return reply(event, "🔮 1日無制限チャット占い（¥1,500）を開始しました。本日中は何件でもOKです。");
+    }
+    if (/定期|月額|サブスク/.test(text)) {
+      u.plan = PLAN.MONTHLY;
+      u.expireAt = 0; // 継続。解約はSTORES側で管理
+      return reply(event, "💫 月額定期鑑定プラン（¥3,000/月）を有効化しました。いつでもご相談ください。");
+    }
+    return reply(event, "ご購入ありがとうございます。プラン名を含めて送ってください（例：購入完了 お試し / 購入完了 無制限 / 購入完了 定期）。");
+  }
+
+  // --- 利用権チェック ---
+  const gate = checkGate(userId);
+  if (!gate.ok) {
+    return reply(event, gate.msg);
+  }
+
+  // === ここから鑑定 ===
+  // 履歴
   const hist = sessions.get(userId) || [];
   hist.push({ role: "user", content: text });
   while (hist.length > MAX_TURNS) hist.shift();
 
-  // ---- プロンプト生成 ----
-  const prompt = buildPrompt(hist);
+  // プロンプト
+  const prompt = buildPrompt(profileName, hist);
 
-  // ---- 生成（OpenAI） ----
-  const reply = await generateWithOpenAI(prompt, hist) || fallbackReply();
+  // 生成
+  const answer = await generateWithOpenAI(prompt, hist) || fallbackReply();
 
-  // 履歴へ追加
-  hist.push({ role: "assistant", content: reply });
+  // 履歴更新
+  hist.push({ role: "assistant", content: answer });
   sessions.set(userId, hist);
 
-  // 返信
-  return client.replyMessage(event.replyToken, { type: "text", text: reply.slice(0, 4900) });
+  // プラン消費処理（お試し1回）
+  consumeIfTrial(userId);
+
+  return reply(event, answer.slice(0, 4900));
 }
 
-function buildPrompt(history) {
-  const recent = history.slice(-6)
-    .map(m => `${m.role === "user" ? "ユーザー" : "占い師"}：${m.content}`)
-    .join("\n");
+function reply(event, text) {
+  return client.replyMessage(event.replyToken, { type: "text", text });
+}
 
-  return `あなたは日本語で鑑定するプロ占い師『りゅうせい』。
+async function safeName(userId) {
+  try { const p = await client.getProfile(userId); return p.displayName || "あなた"; }
+  catch { return "あなた"; }
+}
+
+// ============ プラン周り ============
+function menuText() {
+  return [
+    "🌟 Beauty One_Chat — プラン一覧",
+    "・お試し1回占い：¥500（キーワード：『購入完了 お試し』）",
+    "・無制限チャット占い（1日）：¥1,500（『購入完了 無制限』）",
+    "・定期鑑定プラン（月額）：¥3,000（『購入完了 定期』）",
+    STORE_URL ? `\nご購入はこちら 👉 ${STORE_URL}` : "",
+    "\n※購入後、上記の合言葉をLINEで送って有効化してください。",
+    "※/plan で現在のプランを確認できます。"
+  ].join("\n");
+}
+
+function planStatusText(userId) {
+  const u = users.get(userId) || { plan: PLAN.NONE, expireAt: 0, trialConsumed: false };
+  const now = Date.now();
+  const rest = u.expireAt ? Math.max(0, u.expireAt - now) : 0;
+  const human = rest ? dayjs(u.expireAt).format("M/D HH:mm") + " まで" : (u.plan === PLAN.MONTHLY ? "継続中" : "");
+  const planName = {
+    [PLAN.NONE]: "未購入",
+    [PLAN.TRIAL]: `お試し1回（${u.trialConsumed ? "消費済み" : "未消費"}）`,
+    [PLAN.UNLIMITED]: "1日無制限",
+    [PLAN.MONTHLY]: "月額定期"
+  }[u.plan];
+  return `現在のプラン：${planName}\n有効期限：${human || "—"}\n${STORE_URL ? `\n購入/更新はこちら 👉 ${STORE_URL}` : ""}`;
+}
+
+function checkGate(userId) {
+  const u = users.get(userId);
+  const now = Date.now();
+  // 期限切れ処理
+  if (u.plan === PLAN.UNLIMITED && now > u.expireAt) {
+    u.plan = PLAN.NONE; u.expireAt = 0;
+  }
+  // 月額はGateなし
+  if (u.plan === PLAN.MONTHLY) return { ok: true };
+  // 無制限は期限内OK
+  if (u.plan === PLAN.UNLIMITED) return { ok: true };
+  // お試しは未消費ならOK
+  if (u.plan === PLAN.TRIAL && !u.trialConsumed) return { ok: true };
+
+  // ここまで来たら未購入 or 消費済み
+  const msg = [
+    "🔔 ご利用にはプランの有効化が必要です。",
+    "・お試し1回：¥500 → 『購入完了 お試し』",
+    "・1日無制限：¥1,500 → 『購入完了 無制限』",
+    "・月額定期：¥3,000 → 『購入完了 定期』",
+    STORE_URL ? `\nご購入はこちら 👉 ${STORE_URL}` : ""
+  ].join("\n");
+  return { ok: false, msg };
+}
+
+function consumeIfTrial(userId) {
+  const u = users.get(userId);
+  if (u.plan === PLAN.TRIAL && !u.trialConsumed) {
+    u.trialConsumed = true;
+    // 次の発話からGateに引っかかる（追加購入を促す）
+  }
+}
+
+// ============ 生成系 ============
+function buildPrompt(name, history) {
+  const recent = history.slice(-6)
+    .map(m => `${m.role === "user" ? "ユーザー" : "占い師"}：${m.content}`).join("\n");
+
+  return `あなたは日本語で鑑定する温かいプロ占い師『りゅうせい』。
 結論→理由→アクション→注意点→ひとこと励まし の順で300〜500字。
-断定しすぎずやさしい敬語で、実行可能な提案を必ず入れる。
-医療・法律・投資の確約は禁止。相手を不安にさせる表現は避ける。
+断定しすぎず、実行可能な提案を必ず入れる。恐怖を煽らない。
+医療/法律/投資の確約は禁止。
 
 【直近会話要約】
 ${recent || "（初回）"}
 
+相談者: ${name}
 【鑑定】`;
 }
 
 async function generateWithOpenAI(prompt, history) {
   const apiKey = process.env.OPENAI_API_KEY;
-  const model = process.env.MODEL || "gpt-4o-mini";
-  if (!apiKey) {
-    console.warn("OPENAI_API_KEY が未設定");
-    return null;
-  }
-  try {
-    const messages = [
-      { role: "system", content:
-        "あなたは温かく誠実な占い師『りゅうせい』。相談者の不安を和らげ、具体的行動を提示する。" },
-      ...history.slice(-6).map(m => ({ role: m.role, content: m.content })),
-      { role: "user", content: prompt },
-    ];
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages, temperature: 0.8, top_p: 0.9, max_tokens: 700 })
-    });
-    if (!res.ok) {
-      const t = await res.text();
-      throw new Error(`OpenAI ${res.status} ${t}`);
+  if (!apiKey) { console.warn("OPENAI_API_KEY missing"); return null; }
+
+  const messages = [
+    { role: "system", content: "あなたは誠実で具体的な助言を行う占い師『りゅうせい』。" },
+    ...history.slice(-6).map(m => ({ role: m.role, content: m.content })),
+    { role: "user", content: prompt },
+  ];
+
+  const body = {
+    model: MODEL,
+    messages,
+    temperature: 0.8,
+    top_p: 0.9,
+    max_tokens: 500
+  };
+
+  // 簡易リトライ＋429（残高/レート）ハンドリング
+  for (let i = 0; i < 2; i++) {
+    try {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(body)
+      });
+
+      if (res.status === 429) {
+        const t = await res.text();
+        console.error("LLM 429:", t);
+        if (t.includes("insufficient_quota")) {
+          return "【お知らせ】現在、鑑定枠が上限に達しています。少し時間を置いてお試しください🙏";
+        }
+        await new Promise(r => setTimeout(r, 1200));
+        continue;
+      }
+      if (!res.ok) throw new Error(`OpenAI ${res.status} ${await res.text()}`);
+
+      const data = await res.json();
+      console.log("LLM ok");
+      return data.choices?.[0]?.message?.content?.trim() || null;
+
+    } catch (e) {
+      console.error("LLM error:", e.message || e);
+      await new Promise(r => setTimeout(r, 800));
     }
-    const data = await res.json();
-    const out = data.choices?.[0]?.message?.content?.trim();
-    console.log("LLM ok");
-    return out || null;
-  } catch (e) {
-    console.error("LLM error:", e.message);
-    return null;
   }
+  return null;
 }
 
 function fallbackReply() {
@@ -192,20 +292,6 @@ function fallbackReply() {
 【ひとこと励まし】丁寧な一歩が未来の近道です。`;
 }
 
+// 起動
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on ${port}`));
-
-// 追加：LLMヘルスチェック（テスト後に消してOK）
-app.get("/ping-llm", async (_, res) => {
-  try {
-    const msg = await generateWithOpenAI("テスト鑑定を1文で。", []);
-    if (msg) return res.status(200).send("LLM ok: " + msg.slice(0, 60));
-    return res.status(500).send("LLM ng (fallback)");
-  } catch (e) {
-    return res.status(500).send("LLM error: " + (e.message || e));
-  }
-});
-
-
-
-
