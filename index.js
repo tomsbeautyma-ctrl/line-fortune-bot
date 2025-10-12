@@ -92,9 +92,9 @@ function endOfTodayTs() { return dayjs().endOf("day").valueOf(); }
 // ========= ヘルス系 =========
 app.get("/health", (_,res)=>res.status(200).send("healthy"));
 app.get("/", (_,res)=>res.status(200).send("OK"));
-app.get("/env", async (_,_res)=>{
+app.get("/env", (req,res)=>{
   const OPENAI = !!process.env.OPENAI_API_KEY;
-  return _.status(200).json({ MODEL, OPENAI, STORE_URL, STORES_API_BASE, REDIS: !!REDIS_URL });
+  res.status(200).json({ MODEL, OPENAI, STORE_URL, STORES_API_BASE, REDIS: !!REDIS_URL });
 });
 app.get("/ping-llm", async (_, res) => {
   try { const msg = await generateWithOpenAI("テスト鑑定を一文で。", []); res.status(200).send(msg?`LLM ok: ${msg.slice(0,60)}`:"LLM fallback"); }
@@ -128,79 +128,35 @@ async function handleEvent(event) {
   }
 
   // ========== 認証（注文番号）：「認証 <ORDER_NO>」 他、少しゆるく ==========
-  // 例: 認証 7781352296 / 認識 7781352296 / 注文 7781352296 / order 7781352296
   const auth = text.match(/^(?:認証|認識|注文|コード|order)\s+([A-Za-z0-9\-_]{5,})$/i);
-  // 誤って番号だけ送った場合の誘導
   const justOrder = !auth && text.match(/^([A-Za-z0-9\-_]{6,})$/);
   if (justOrder) {
     return reply(event, `ご購入ありがとうございます。\n認証の形式で送ってください：\n例）認証 ${justOrder[1]}`);
   }
 
   if (auth) {
-    const orderNo = auth[1];
+    const orderNo = auth[1];                    // ← ここを使う
     const used = await kvGet(`order:used:${orderNo}`);
     if (used === "1") {
       return reply(event, "この注文番号はすでに使用済みです。ご不明点はサポートまで。");
     }
 
-   // ========= STORES API（修正版） =========
-async function fetchStoresOrder(orderInput) {
-  if (!STORES_API_KEY) {
-    console.log("❌ STORES_API_KEY 未設定");
-    return null;
+    const order = await fetchStoresOrder(orderNo); // ← 修正済み
+    if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
+    if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
+
+    const plan = inferPlan(order); // {type, expireAt?, orderId?}
+    if (!plan) return reply(event, "商品が特定できませんでした。サポートまでご連絡ください。");
+
+    // 付与
+    await kvSet(`user:plan:${userId}`, JSON.stringify(plan));
+    await kvSet(`order:used:${orderNo}`, "1");
+
+    const planName = plan.type===PLAN.TRIAL ? "お試し（1購入=1質問）"
+                    : plan.type===PLAN.UNLIMITED ? "1日無制限（当日23:59まで）"
+                    : "月額定期";
+    return reply(event, `✅ 購入を確認しました。${planName}を有効化しました。\nご相談内容を送信してください。`);
   }
-
-  const base = STORES_API_BASE;
-  const headersList = [
-    { Authorization: `Bearer ${STORES_API_KEY}`, Accept: "application/json" },
-    { "X-API-KEY": STORES_API_KEY, Accept: "application/json" },
-  ];
-
-  console.log("🟡 [AUTH try] 注文番号:", orderInput, "BASE:", base);
-
-  const tryFetch = async (url) => {
-    for (const h of headersList) {
-      try {
-        const r = await fetch(url, { headers: h });
-        const text = await r.text();
-        if (r.ok && text.startsWith("{")) {
-          const j = JSON.parse(text);
-          console.log("✅ STORES応答成功:", url);
-          return j;
-        } else {
-          console.log("⚠️ STORES応答:", r.status, url, text.slice(0, 120));
-        }
-      } catch (e) {
-        console.log("❌ STORES fetch err:", url, e.message || e);
-      }
-    }
-    return null;
-  };
-
-  // ✅ 注文番号で検索
-  const q = encodeURIComponent(orderInput);
-  let list = await tryFetch(`${base}/v1/orders/search?query=${q}`);
-
-  if (list?.orders?.length) {
-    const hit = list.orders.find(o =>
-      [o.number, o.order_number].some(v => String(v) === String(orderInput))
-    );
-    if (hit) {
-      console.log("✅ 注文番号ヒット:", hit.number || hit.order_number);
-      return hit;
-    }
-  }
-
-  // ✅ 内部ID直指定 fallback
-  const one = await tryFetch(`${base}/v1/orders/${q}`);
-  if (one && (one.id || one.number || one.order_number)) {
-    console.log("✅ IDヒット:", one.id);
-    return one;
-  }
-
-  console.log("❌ 注文が見つかりません:", orderInput);
-  return null;
-}
 
   // ========== 利用権チェック ==========
   const stRaw = await kvGet(`user:plan:${userId}`);
@@ -257,16 +213,17 @@ async function saveSession(userId, hist){
   await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
 }
 
-// ========= STORES API（注文番号検索＋ID直参照／Bearer & X-API-KEY 両対応／詳細ログ） =========
+// ========= STORES API（修正版：検索API＋ID直参照 / JSON強制 / 両方式Auth） =========
 async function fetchStoresOrder(orderInput) {
   if (!STORES_API_KEY) {
     console.log("❌ STORES_API_KEY 未設定");
     return null;
   }
+
   const base = STORES_API_BASE;
   const headersList = [
-    { Authorization: `Bearer ${STORES_API_KEY}` },
-    { "X-API-KEY": STORES_API_KEY },
+    { Authorization: `Bearer ${STORES_API_KEY}`, Accept: "application/json" },
+    { "X-API-KEY": STORES_API_KEY,           Accept: "application/json" },
   ];
 
   console.log("🟡 [AUTH try] 注文番号:", orderInput, "BASE:", base);
@@ -276,11 +233,12 @@ async function fetchStoresOrder(orderInput) {
       try {
         const r = await fetch(url, { headers: h });
         const text = await r.text();
-        if (r.ok) {
+        if (r.ok && text.trim().startsWith("{")) {
+          const j = JSON.parse(text);
           console.log("✅ STORES応答成功:", url);
-          return JSON.parse(text);
+          return j;
         } else {
-          console.log("⚠️ STORES応答:", r.status, url, text.slice(0, 180));
+          console.log("⚠️ STORES応答:", r.status, url, text.slice(0, 160));
         }
       } catch (e) {
         console.log("❌ STORES fetch err:", url, e.message || e);
@@ -289,21 +247,22 @@ async function fetchStoresOrder(orderInput) {
     return null;
   };
 
-  // 1) 注文番号(number)での検索
-  const qs = encodeURIComponent(orderInput);
-  let list = await tryFetch(`${base}/v1/orders?number=${qs}`);
-  if (!list) list = await tryFetch(`${base}/v1/orders?order_number=${qs}`);
+  // ✅ 注文番号で検索（/search）
+  const q = encodeURIComponent(orderInput);
+  let list = await tryFetch(`${base}/v1/orders/search?query=${q}`);
 
   if (list?.orders?.length) {
-    const hit = list.orders.find(o => (o.number || o.order_number || "").toString() === orderInput.toString());
+    const hit = list.orders.find(o =>
+      [o.number, o.order_number].some(v => String(v) === String(orderInput))
+    );
     if (hit) {
       console.log("✅ 注文番号ヒット:", hit.number || hit.order_number);
       return hit;
     }
   }
 
-  // 2) 内部ID直指定（万一、番号ではなくIDが来た場合）
-  const one = await tryFetch(`${base}/v1/orders/${qs}`);
+  // ✅ 内部ID直指定 fallback
+  const one = await tryFetch(`${base}/v1/orders/${q}`);
   if (one && (one.id || one.number || one.order_number)) {
     console.log("✅ IDヒット:", one.id);
     return one;
@@ -326,7 +285,6 @@ function inferPlan(order){
 
   console.log("🧾 購入商品:", skuConcat);
 
-  // SKU/タイトルに含めておくと判定が堅い： TRIAL-500 / DAY-1500 / SUB-3000
   if (/\bTRIAL-500\b/.test(skuConcat) || /お試し/.test(skuConcat)) {
     console.log("🎯 お試しプラン検出");
     return { type: PLAN.TRIAL, orderId: order.id || order.number || order.order_number, expireAt: 0 };
@@ -400,6 +358,6 @@ function fallbackReply(){
 }
 function reply(event, text){ return client.replyMessage(event.replyToken, { type:"text", text }); }
 
-const port = process.env.PORT || 3000;
+// Renderは10000推奨
+const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
-
