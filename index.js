@@ -1,70 +1,114 @@
-// index.js — LINE占いBot（3プラン対応：お試し/1日無制限/月額定期）
+// index.js — 購入者限定 / STORES注文認証 / Redis永続 / 3プラン対応
 
 import express from "express";
 import fetch from "node-fetch";
 import dayjs from "dayjs";
 import { Client, middleware } from "@line/bot-sdk";
 
-/* ====== 環境変数 ======
-LINE_ACCESS_TOKEN: LINE長期アクセストークン
-LINE_CHANNEL_SECRET: LINEチャネルシークレット
-OPENAI_API_KEY: OpenAI APIキー
-MODEL: gpt-4o-mini（推奨。なければデフォルト使用）
-STORE_URL: STORESの商品一覧やLPのURL（未設定でも動作）
-===================== */
+/* ========= 環境変数 =========
+LINE_ACCESS_TOKEN, LINE_CHANNEL_SECRET
+OPENAI_API_KEY, MODEL (推奨: gpt-4o-mini)
+
+STORES_API_BASE  (例: https://api.stores.jp)
+STORES_API_KEY   (読み取り用APIキー)
+
+REDIS_URL  (Upstash REST URL)
+REDIS_TOKEN(Upstash REST TOKEN)
+
+STORE_URL  (購入ページURLを案内で表示)
+PORT       (Renderは 10000 を推奨)
+============================ */
 
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 const MODEL = process.env.MODEL || "gpt-4o-mini";
-const STORE_URL = process.env.STORE_URL || "https://your-stores.example.com/";
+const STORE_URL = process.env.STORE_URL || "https://beauty-one.stores.jp";
+
+const STORES_API_BASE = process.env.STORES_API_BASE || "https://api.stores.jp";
+const STORES_API_KEY  = process.env.STORES_API_KEY || "";
+
+const REDIS_URL   = process.env.REDIS_URL || "";
+const REDIS_TOKEN = process.env.REDIS_TOKEN || "";
 
 const app = express();
 const client = new Client(config);
 
-/* ==========
-  簡易DB（プロセス内）
-  本番で永続化したい場合は Redis / Firestore などに置換してください。
-============= */
-const sessions = new Map();   // userId -> [{role, content}]
-const users = new Map();      // userId -> { plan, expireAt, trialConsumed }
-const MAX_TURNS = 10;
+// ========= 収納（Redisラッパ / フォールバックなし：本番は必須） ==========
+async function kvGet(key) {
+  if (!REDIS_URL || !REDIS_TOKEN) return null;
+  const r = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+  });
+  if (!r.ok) return null;
+  const j = await r.json(); return j?.result ?? null;
+}
+async function kvSet(key, val) {
+  if (!REDIS_URL || !REDIS_TOKEN) return;
+  await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+  });
+}
+async function kvDel(key) {
+  if (!REDIS_URL || !REDIS_TOKEN) return;
+  await fetch(`${REDIS_URL}/del/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+  });
+}
 
-// プラン種別
-const PLAN = {
-  NONE: "none",
-  TRIAL: "trial",        // お試し1回
-  UNLIMITED: "unlimited",// 1日無制限
-  MONTHLY: "monthly"     // 月額定期
-};
+// ========= 文字列 ==========
+const PURCHASE_ONLY_MESSAGE =
+  `🔒 この占いサービスはご購入者限定です
 
-// ============ ヘルス系 ===============
-app.get("/health", (_, res) => res.status(200).send("healthy"));
-app.get("/", (_, res) => res.status(200).send("OK"));
-app.get("/env", (_, res) => res.json({
-  MODEL,
-  OPENAI: !!process.env.OPENAI_API_KEY,
-  STORE_URL
-}));
+Beauty Oneの公式ストアでプランをご購入後、
+購入完了画面に表示の【注文番号】を
+このLINEに「認証 注文番号」の形式で送信してください。
 
-// LLM疎通テスト（必要なら）
+🪄 プラン一覧
+・お試し鑑定（1購入=1質問）¥500  ※何度でも再購入OK
+・1日無制限チャット占い ¥1,500（当日23:59まで）
+・定期鑑定（月額）¥3,000
+
+🔗 ご購入はこちら 👉 ${STORE_URL}`;
+
+const TRIAL_REPURCHASE_MSG =
+  "お試し鑑定は 1購入につき1質問までとなります。何度でも再購入いただけます。ご購入後、表示される【注文番号】を「認証 注文番号」で送信すると鑑定が開始されます。";
+
+const HELP_MSG =
+  `使い方：
+1) ストアで購入 → 注文番号を取得
+2) LINEで「認証 1234ABCD」のように送信
+3) 有効化後にご相談内容を送信
+
+🔗 購入：${STORE_URL}`;
+
+// ========= プラン定義 =========
+const PLAN = { NONE:"none", TRIAL:"trial", UNLIMITED:"unlimited", MONTHLY:"monthly" };
+
+function endOfTodayTs() { return dayjs().endOf("day").valueOf(); }
+
+// ========= ヘルス系 =========
+app.get("/health", (_,res)=>res.status(200).send("healthy"));
+app.get("/", (_,res)=>res.status(200).send("OK"));
+app.get("/env", async (_,_res)=>{
+  const OPENAI = !!process.env.OPENAI_API_KEY;
+  return _.status(200).json({ MODEL, OPENAI, STORE_URL, STORES_API_BASE, REDIS: !!REDIS_URL });
+});
 app.get("/ping-llm", async (_, res) => {
-  try {
-    const msg = await generateWithOpenAI("テスト鑑定を一文で。", []);
-    res.status(200).send(msg ? `LLM ok: ${msg.slice(0,60)}` : "LLM fallback");
-  } catch (e) {
-    res.status(500).send("LLM error: " + (e.message || e));
-  }
+  try { const msg = await generateWithOpenAI("テスト鑑定を一文で。", []); res.status(200).send(msg?`LLM ok: ${msg.slice(0,60)}`:"LLM fallback"); }
+  catch(e){ res.status(500).send("LLM error: " + (e.message||e)); }
 });
 
-// ============ Webhook ============
+// ========= Webhook =========
 app.post("/webhook", middleware(config), async (req, res) => {
   try {
     const events = req.body?.events ?? [];
     await Promise.all(events.map(handleEvent));
     res.sendStatus(200);
-  } catch (e) {
+  } catch(e) {
     console.error("webhook error:", e);
     res.sendStatus(500);
   }
@@ -72,156 +116,138 @@ app.post("/webhook", middleware(config), async (req, res) => {
 
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
-
   const userId = event.source.userId;
   const text = (event.message.text || "").trim();
-  console.log("LINE msg:", userId, text);
 
-  // --- 初期化 ---
-  if (!users.has(userId)) {
-    users.set(userId, { plan: PLAN.NONE, expireAt: 0, trialConsumed: false });
+  // メニュー/ヘルプ
+  if (["メニュー","/menu","menu","help","？","?"].includes(text)) {
+    return reply(event, HELP_MSG);
   }
-  const profileName = await safeName(userId);
-
-  // --- コマンド ---
-  // メニュー
-  if (["メニュー","menu","/menu","はじめる","help","？","?"].includes(text)) {
-    return reply(event, menuText());
-  }
-  // 状態確認
-  if (["/plan","プラン","状態","ステータス"].includes(text)) {
-    return reply(event, planStatusText(userId));
-  }
-  // 履歴リセット
   if (["リセット","/reset","reset"].includes(text)) {
-    sessions.delete(userId);
-    return reply(event, "会話履歴をリセットしました。占い内容をどうぞ。");
+    await kvDel(`sess:${userId}`);
+    return reply(event,"会話履歴をリセットしました。ご相談内容をどうぞ。");
   }
 
-  // --- STORES購入後の合言葉（文言は商品説明に明記） ---
-  // 例）「購入完了 お試し」「購入完了 無制限」「購入完了 定期」
-  if (/購入完了/.test(text)) {
-    const u = users.get(userId);
-    if (/お試し|試し|1回/.test(text)) {
-      u.plan = PLAN.TRIAL;
-      u.expireAt = 0;
-      return reply(event, "🪄 お試し1回占い（¥500）を有効化しました。質問を1件どうぞ。");
+  // ========== 認証（注文番号）：「認証 <ORDER_ID>」 ==========
+  const auth = text.match(/^認証\s+([A-Za-z0-9\-\_]{5,})$/);
+  if (auth) {
+    const orderId = auth[1];
+    const used = await kvGet(`order:used:${orderId}`);
+    if (used === "1") {
+      return reply(event, "この注文番号はすでに使用済みです。ご不明点はサポートまで。");
     }
-    if (/無制限|1日|当日/.test(text)) {
-      u.plan = PLAN.UNLIMITED;
-      u.expireAt = dayjs().endOf("day").valueOf(); // 今日の23:59まで
-      return reply(event, "🔮 1日無制限チャット占い（¥1,500）を開始しました。本日中は何件でもOKです。");
-    }
-    if (/定期|月額|サブスク/.test(text)) {
-      u.plan = PLAN.MONTHLY;
-      u.expireAt = 0; // 継続。解約はSTORES側で管理
-      return reply(event, "💫 月額定期鑑定プラン（¥3,000/月）を有効化しました。いつでもご相談ください。");
-    }
-    return reply(event, "ご購入ありがとうございます。プラン名を含めて送ってください（例：購入完了 お試し / 購入完了 無制限 / 購入完了 定期）。");
+    const order = await fetchStoresOrder(orderId);
+    if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
+    if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
+
+    const plan = inferPlan(order); // {type, expireAt?, oneShotOrderId?}
+    if (!plan) return reply(event, "商品が特定できませんでした。サポートまでご連絡ください。");
+
+    // 付与
+    await kvSet(`user:plan:${userId}`, JSON.stringify(plan));
+    await kvSet(`order:used:${orderId}`, "1");
+
+    const planName = plan.type===PLAN.TRIAL ? "お試し（1購入=1質問）"
+                    : plan.type===PLAN.UNLIMITED ? "1日無制限（当日23:59まで）"
+                    : "月額定期";
+    return reply(event, `✅ 購入を確認しました。${planName}を有効化しました。\nご相談内容を送信してください。`);
   }
 
-  // --- 利用権チェック ---
-  const gate = checkGate(userId);
-  if (!gate.ok) {
-    return reply(event, gate.msg);
+  // ========== 利用権チェック ==========
+  const stRaw = await kvGet(`user:plan:${userId}`);
+  if (!stRaw) {
+    return reply(event, PURCHASE_ONLY_MESSAGE);
+  }
+  const st = JSON.parse(stRaw);
+  // 期限確認
+  if (st.expireAt && Date.now() > st.expireAt) {
+    await kvDel(`user:plan:${userId}`);
+    return reply(event, "プランの有効期限が切れました。\n" + PURCHASE_ONLY_MESSAGE);
   }
 
-  // === ここから鑑定 ===
-  // 履歴
-  const hist = sessions.get(userId) || [];
-  hist.push({ role: "user", content: text });
-  while (hist.length > MAX_TURNS) hist.shift();
+  // お試し：1購入=1回答ガード
+  if (st.type === PLAN.TRIAL) {
+    // コマンド類は消費扱いにしない
+    const isCommand = ["メニュー","/menu","menu","help","？","?","リセット","/reset","reset","認証"]
+      .some(k => text.includes(k));
+    const consumedKey = `trial:consumed:${userId}:${st.orderId}`;
+    const consumed = await kvGet(consumedKey);
+    if (consumed === "1") {
+      return reply(event, TRIAL_REPURCHASE_MSG);
+    }
+    if (isCommand) {
+      return reply(event, "お試しは1購入につき1質問です。占いたい内容を1つだけ送ってください。");
+    }
+    // → このまま鑑定へ（回答後に消費フラグを立てる）
+  }
 
-  // プロンプト
-  const prompt = buildPrompt(profileName, hist);
+  // ========== 鑑定フロー ==========
+  const hist = await loadSession(userId);
+  hist.push({ role:"user", content:text });
+  while (hist.length > 10) hist.shift();
 
-  // 生成
+  const name = await safeName(userId);
+  const prompt = buildPrompt(name, hist);
   const answer = await generateWithOpenAI(prompt, hist) || fallbackReply();
 
-  // 履歴更新
-  hist.push({ role: "assistant", content: answer });
-  sessions.set(userId, hist);
+  hist.push({ role:"assistant", content:answer });
+  await saveSession(userId, hist);
 
-  // プラン消費処理（お試し1回）
-  consumeIfTrial(userId);
-
+  // お試しなら“消費”マーク
+  if (st.type === PLAN.TRIAL) {
+    await kvSet(`trial:consumed:${userId}:${st.orderId}`,"1");
+  }
   return reply(event, answer.slice(0, 4900));
 }
 
-function reply(event, text) {
-  return client.replyMessage(event.replyToken, { type: "text", text });
+// ========= セッション保存（Redis） =========
+async function loadSession(userId){
+  const raw = await kvGet(`sess:${userId}`);
+  return raw ? JSON.parse(raw) : [];
+}
+async function saveSession(userId, hist){
+  await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
 }
 
-async function safeName(userId) {
-  try { const p = await client.getProfile(userId); return p.displayName || "あなた"; }
-  catch { return "あなた"; }
+// ========= STORES API =========
+async function fetchStoresOrder(orderId){
+  if (!STORES_API_KEY) return null;
+  try {
+    // 注文番号直接参照の想定エンドポイント（必要に応じて調整）
+    const url = `${STORES_API_BASE.replace(/\/$/,"")}/v1/orders/${encodeURIComponent(orderId)}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${STORES_API_KEY}` }});
+    if (!r.ok) { console.error("STORES", r.status, await r.text()); return null; }
+    return await r.json(); // 例：{ id, status, items:[{sku,title,quantity}], ... }
+  } catch(e){ console.error("stores api err:", e); return null; }
 }
-
-// ============ プラン周り ============
-function menuText() {
-  return [
-    "🌟 Beauty One_Chat — プラン一覧",
-    "・お試し1回占い：¥500（キーワード：『購入完了 お試し』）",
-    "・無制限チャット占い（1日）：¥1,500（『購入完了 無制限』）",
-    "・定期鑑定プラン（月額）：¥3,000（『購入完了 定期』）",
-    STORE_URL ? `\nご購入はこちら 👉 ${STORE_URL}` : "",
-    "\n※購入後、上記の合言葉をLINEで送って有効化してください。",
-    "※/plan で現在のプランを確認できます。"
-  ].join("\n");
+function isPaid(order){
+  const s = (order?.status||"").toLowerCase();
+  return ["paid","authorized","captured","settled"].some(x=>s.includes(x));
 }
+function inferPlan(order){
+  const items = order?.items || [];
+  const skuConcat = items.map(it=>(it.sku||"")+":"+(it.title||"")).join(" ").toUpperCase();
 
-function planStatusText(userId) {
-  const u = users.get(userId) || { plan: PLAN.NONE, expireAt: 0, trialConsumed: false };
-  const now = Date.now();
-  const rest = u.expireAt ? Math.max(0, u.expireAt - now) : 0;
-  const human = rest ? dayjs(u.expireAt).format("M/D HH:mm") + " まで" : (u.plan === PLAN.MONTHLY ? "継続中" : "");
-  const planName = {
-    [PLAN.NONE]: "未購入",
-    [PLAN.TRIAL]: `お試し1回（${u.trialConsumed ? "消費済み" : "未消費"}）`,
-    [PLAN.UNLIMITED]: "1日無制限",
-    [PLAN.MONTHLY]: "月額定期"
-  }[u.plan];
-  return `現在のプラン：${planName}\n有効期限：${human || "—"}\n${STORE_URL ? `\n購入/更新はこちら 👉 ${STORE_URL}` : ""}`;
-}
-
-function checkGate(userId) {
-  const u = users.get(userId);
-  const now = Date.now();
-  // 期限切れ処理
-  if (u.plan === PLAN.UNLIMITED && now > u.expireAt) {
-    u.plan = PLAN.NONE; u.expireAt = 0;
+  // SKU/タイトルに含めておくと判定が堅い： TRIAL-500 / DAY-1500 / SUB-3000
+  if (/\bTRIAL-500\b/.test(skuConcat) || /お試し/i.test(skuConcat)) {
+    return { type: PLAN.TRIAL, orderId: order.id, expireAt: 0 };
   }
-  // 月額はGateなし
-  if (u.plan === PLAN.MONTHLY) return { ok: true };
-  // 無制限は期限内OK
-  if (u.plan === PLAN.UNLIMITED) return { ok: true };
-  // お試しは未消費ならOK
-  if (u.plan === PLAN.TRIAL && !u.trialConsumed) return { ok: true };
-
-  // ここまで来たら未購入 or 消費済み
-  const msg = [
-    "🔔 ご利用にはプランの有効化が必要です。",
-    "・お試し1回：¥500 → 『購入完了 お試し』",
-    "・1日無制限：¥1,500 → 『購入完了 無制限』",
-    "・月額定期：¥3,000 → 『購入完了 定期』",
-    STORE_URL ? `\nご購入はこちら 👉 ${STORE_URL}` : ""
-  ].join("\n");
-  return { ok: false, msg };
-}
-
-function consumeIfTrial(userId) {
-  const u = users.get(userId);
-  if (u.plan === PLAN.TRIAL && !u.trialConsumed) {
-    u.trialConsumed = true;
-    // 次の発話からGateに引っかかる（追加購入を促す）
+  if (/\bDAY-1500\b/.test(skuConcat) || /無制限|1日/i.test(skuConcat)) {
+    return { type: PLAN.UNLIMITED, orderId: order.id, expireAt: endOfTodayTs() };
   }
+  if (/\bSUB-3000\b/.test(skuConcat) || /定期|月額/i.test(skuConcat)) {
+    return { type: PLAN.MONTHLY, orderId: order.id, expireAt: 0 };
+  }
+  return null;
 }
 
-// ============ 生成系 ============
-function buildPrompt(name, history) {
-  const recent = history.slice(-6)
-    .map(m => `${m.role === "user" ? "ユーザー" : "占い師"}：${m.content}`).join("\n");
-
+// ========= LLM =========
+async function safeName(userId){
+  try{ const p = await client.getProfile(userId); return p.displayName || "あなた"; }
+  catch{ return "あなた"; }
+}
+function buildPrompt(name, history){
+  const recent = history.slice(-6).map(m => `${m.role==="user"?"ユーザー":"占い師"}：${m.content}`).join("\n");
   return `あなたは日本語で鑑定する温かいプロ占い師『りゅうせい』。
 結論→理由→アクション→注意点→ひとこと励まし の順で300〜500字。
 断定しすぎず、実行可能な提案を必ず入れる。恐怖を煽らない。
@@ -233,65 +259,44 @@ ${recent || "（初回）"}
 相談者: ${name}
 【鑑定】`;
 }
-
-async function generateWithOpenAI(prompt, history) {
+async function generateWithOpenAI(prompt, history){
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) { console.warn("OPENAI_API_KEY missing"); return null; }
-
+  if (!apiKey) return null;
   const messages = [
-    { role: "system", content: "あなたは誠実で具体的な助言を行う占い師『りゅうせい』。" },
-    ...history.slice(-6).map(m => ({ role: m.role, content: m.content })),
-    { role: "user", content: prompt },
+    { role:"system", content:"あなたは誠実で具体的な助言を行う占い師『りゅうせい』。" },
+    ...history.slice(-6).map(m=>({role:m.role, content:m.content})),
+    { role:"user", content: prompt },
   ];
+  const body = { model: MODEL, messages, temperature: 0.8, top_p: 0.9, max_tokens: 500 };
 
-  const body = {
-    model: MODEL,
-    messages,
-    temperature: 0.8,
-    top_p: 0.9,
-    max_tokens: 500
-  };
-
-  // 簡易リトライ＋429（残高/レート）ハンドリング
-  for (let i = 0; i < 2; i++) {
-    try {
-      const res = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+  for (let i=0;i<2;i++){
+    try{
+      const r = await fetch("https://api.openai.com/v1/chat/completions",{
+        method:"POST",
+        headers:{ "Content-Type":"application/json", Authorization:`Bearer ${apiKey}` },
         body: JSON.stringify(body)
       });
-
-      if (res.status === 429) {
-        const t = await res.text();
-        console.error("LLM 429:", t);
-        if (t.includes("insufficient_quota")) {
-          return "【お知らせ】現在、鑑定枠が上限に達しています。少し時間を置いてお試しください🙏";
-        }
-        await new Promise(r => setTimeout(r, 1200));
+      if (r.status===429){
+        const t = await r.text();
+        if (t.includes("insufficient_quota")) return "【お知らせ】鑑定枠が上限に達しています。時間を置いてお試しください。";
+        await new Promise(res=>setTimeout(res, 1200));
         continue;
       }
-      if (!res.ok) throw new Error(`OpenAI ${res.status} ${await res.text()}`);
-
-      const data = await res.json();
-      console.log("LLM ok");
+      if (!r.ok) throw new Error(`OpenAI ${r.status} ${await r.text()}`);
+      const data = await r.json();
       return data.choices?.[0]?.message?.content?.trim() || null;
-
-    } catch (e) {
-      console.error("LLM error:", e.message || e);
-      await new Promise(r => setTimeout(r, 800));
-    }
+    }catch(e){ console.error("LLM error:", e.message||e); await new Promise(res=>setTimeout(res, 800)); }
   }
   return null;
 }
-
-function fallbackReply() {
+function fallbackReply(){
   return `【結論】流れは落ち着いて上向き。焦らず整えるほど成果に結びつきます。
 【理由】足元を固めるほど選択の質が上がる運気。
 【アクション】今日ひとつだけ「連絡／整理／メモ化」を完了。
 【注意点】夜の衝動決断は回避。判断は翌朝に。
 【ひとこと励まし】丁寧な一歩が未来の近道です。`;
 }
+function reply(event, text){ return client.replyMessage(event.replyToken, { type:"text", text }); }
 
-// 起動
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on ${port}`));
+app.listen(port, ()=>console.log(`Server running on ${port}`));
