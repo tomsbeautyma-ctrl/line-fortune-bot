@@ -1,4 +1,5 @@
 // index.js — 購入者限定 / STORES注文認証 / Redis永続 / 3プラン対応（完全版）
+const APP_REV = "rev-2025-10-12-22:10"; console.log("[BOOT]", APP_REV);
 
 import express from "express";
 import fetch from "node-fetch";
@@ -361,3 +362,4 @@ function reply(event, text){ return client.replyMessage(event.replyToken, { type
 // Renderは10000推奨
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
