@@ -141,79 +141,6 @@ async function handleEvent(event) {
     if (used === "1") {
       return reply(event, "この注文番号はすでに使用済みです。ご不明点はサポートまで。");
     }
-
-    const order = await fetchStoresOrder(orderNo); // ← 修正済み
-    if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
-    if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
-
-    const plan = inferPlan(order); // {type, expireAt?, orderId?}
-    if (!plan) return reply(event, "商品が特定できませんでした。サポートまでご連絡ください。");
-
-    // 付与
-    await kvSet(`user:plan:${userId}`, JSON.stringify(plan));
-    await kvSet(`order:used:${orderNo}`, "1");
-
-    const planName = plan.type===PLAN.TRIAL ? "お試し（1購入=1質問）"
-                    : plan.type===PLAN.UNLIMITED ? "1日無制限（当日23:59まで）"
-                    : "月額定期";
-    return reply(event, `✅ 購入を確認しました。${planName}を有効化しました。\nご相談内容を送信してください。`);
-  }
-
-  // ========== 利用権チェック ==========
-  const stRaw = await kvGet(`user:plan:${userId}`);
-  if (!stRaw) {
-    return reply(event, PURCHASE_ONLY_MESSAGE);
-  }
-  const st = JSON.parse(stRaw);
-  // 期限確認
-  if (st.expireAt && Date.now() > st.expireAt) {
-    await kvDel(`user:plan:${userId}`);
-    return reply(event, "プランの有効期限が切れました。\n" + PURCHASE_ONLY_MESSAGE);
-  }
-
-  // お試し：1購入=1回答ガード
-  if (st.type === PLAN.TRIAL) {
-    const isCommand = ["メニュー","/menu","menu","help","？","?","リセット","/reset","reset","認証","認識","注文","order","コード"]
-      .some(k => text.includes(k));
-    const consumedKey = `trial:consumed:${userId}:${st.orderId}`;
-    const consumed = await kvGet(consumedKey);
-    if (consumed === "1") {
-      return reply(event, TRIAL_REPURCHASE_MSG);
-    }
-    if (isCommand) {
-      return reply(event, "お試しは1購入につき1質問です。占いたい内容を1つだけ送ってください。");
-    }
-    // → このまま鑑定へ（回答後に消費フラグを立てる）
-  }
-
-  // ========== 鑑定フロー ==========
-  const hist = await loadSession(userId);
-  hist.push({ role:"user", content:text });
-  while (hist.length > 10) hist.shift();
-
-  const name = await safeName(userId);
-  const prompt = buildPrompt(name, hist);
-  const answer = await generateWithOpenAI(prompt, hist) || fallbackReply();
-
-  hist.push({ role:"assistant", content:answer });
-  await saveSession(userId, hist);
-
-  // お試しなら“消費”マーク
-  if (st.type === PLAN.TRIAL) {
-    await kvSet(`trial:consumed:${userId}:${st.orderId}`,"1");
-  }
-  return reply(event, answer.slice(0, 4900));
-}
-
-// ========= セッション保存（Redis） =========
-async function loadSession(userId){
-  const raw = await kvGet(`sess:${userId}`);
-  return raw ? JSON.parse(raw) : [];
-}
-async function saveSession(userId, hist){
-  await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
-}
-
 // ========= STORES API（修正版：検索API＋ID直参照 / JSON強制 / 両方式Auth） =========
 async function fetchStoresOrder(orderInput) {
   if (!STORES_API_KEY) {
@@ -232,14 +159,16 @@ async function fetchStoresOrder(orderInput) {
   const tryFetch = async (url) => {
     for (const h of headersList) {
       try {
+        console.log("➡️  fetch:", url, "headers:", Object.keys(h).join(","));
         const r = await fetch(url, { headers: h });
         const text = await r.text();
-        if (r.ok && text.trim().startsWith("{")) {
+        const ctype = r.headers.get("content-type") || "";
+        if (r.ok && ctype.includes("application/json")) {
           const j = JSON.parse(text);
           console.log("✅ STORES応答成功:", url);
           return j;
         } else {
-          console.log("⚠️ STORES応答:", r.status, url, text.slice(0, 160));
+          console.log("⚠️ STORES応答:", r.status, url, "ctype:", ctype, "body:", text.slice(0, 140));
         }
       } catch (e) {
         console.log("❌ STORES fetch err:", url, e.message || e);
@@ -262,7 +191,7 @@ async function fetchStoresOrder(orderInput) {
     }
   }
 
-  // ✅ 内部ID直指定 fallback
+  // ✅ 内部ID直指定 fallback（番号がそのままIDだった場合に備え）
   const one = await tryFetch(`${base}/v1/orders/${q}`);
   if (one && (one.id || one.number || one.order_number)) {
     console.log("✅ IDヒット:", one.id);
@@ -272,6 +201,7 @@ async function fetchStoresOrder(orderInput) {
   console.log("❌ 注文が見つかりません:", orderInput);
   return null;
 }
+
 
 function isPaid(order){
   const s = String(order?.status || "").toLowerCase();
@@ -362,4 +292,5 @@ function reply(event, text){ return client.replyMessage(event.replyToken, { type
 // Renderは10000推奨
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
 
