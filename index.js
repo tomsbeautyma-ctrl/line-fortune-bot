@@ -1,4 +1,4 @@
-// index.js — 購入者限定 / STORES注文認証 / Redis永続 / 3プラン対応
+// index.js — 購入者限定 / STORES注文認証 / Redis永続 / 3プラン対応（完全版）
 
 import express from "express";
 import fetch from "node-fetch";
@@ -10,7 +10,7 @@ LINE_ACCESS_TOKEN, LINE_CHANNEL_SECRET
 OPENAI_API_KEY, MODEL (推奨: gpt-4o-mini)
 
 STORES_API_BASE  (例: https://api.stores.jp)
-STORES_API_KEY   (読み取り用APIキー)
+STORES_API_KEY   (読み取り用APIキー)  ※Bearer / X-API-KEY の両方対応
 
 REDIS_URL  (Upstash REST URL)
 REDIS_TOKEN(Upstash REST TOKEN)
@@ -26,7 +26,7 @@ const config = {
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 const STORE_URL = process.env.STORE_URL || "https://beauty-one.stores.jp";
 
-const STORES_API_BASE = process.env.STORES_API_BASE || "https://api.stores.jp";
+const STORES_API_BASE = (process.env.STORES_API_BASE || "https://api.stores.jp").replace(/\/$/, "");
 const STORES_API_KEY  = process.env.STORES_API_KEY || "";
 
 const REDIS_URL   = process.env.REDIS_URL || "";
@@ -87,7 +87,6 @@ const HELP_MSG =
 
 // ========= プラン定義 =========
 const PLAN = { NONE:"none", TRIAL:"trial", UNLIMITED:"unlimited", MONTHLY:"monthly" };
-
 function endOfTodayTs() { return dayjs().endOf("day").valueOf(); }
 
 // ========= ヘルス系 =========
@@ -128,24 +127,32 @@ async function handleEvent(event) {
     return reply(event,"会話履歴をリセットしました。ご相談内容をどうぞ。");
   }
 
-  // ========== 認証（注文番号）：「認証 <ORDER_ID>」 ==========
-  const auth = text.match(/^認証\s+([A-Za-z0-9\-\_]{5,})$/);
+  // ========== 認証（注文番号）：「認証 <ORDER_NO>」 他、少しゆるく ==========
+  // 例: 認証 7781352296 / 認識 7781352296 / 注文 7781352296 / order 7781352296
+  const auth = text.match(/^(?:認証|認識|注文|コード|order)\s+([A-Za-z0-9\-_]{5,})$/i);
+  // 誤って番号だけ送った場合の誘導
+  const justOrder = !auth && text.match(/^([A-Za-z0-9\-_]{6,})$/);
+  if (justOrder) {
+    return reply(event, `ご購入ありがとうございます。\n認証の形式で送ってください：\n例）認証 ${justOrder[1]}`);
+  }
+
   if (auth) {
-    const orderId = auth[1];
-    const used = await kvGet(`order:used:${orderId}`);
+    const orderNo = auth[1];
+    const used = await kvGet(`order:used:${orderNo}`);
     if (used === "1") {
       return reply(event, "この注文番号はすでに使用済みです。ご不明点はサポートまで。");
     }
-    const order = await fetchStoresOrder(orderId);
+
+    const order = await fetchStoresOrder(orderNo);
     if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
     if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
 
-    const plan = inferPlan(order); // {type, expireAt?, oneShotOrderId?}
+    const plan = inferPlan(order); // {type, expireAt?, orderId?}
     if (!plan) return reply(event, "商品が特定できませんでした。サポートまでご連絡ください。");
 
     // 付与
     await kvSet(`user:plan:${userId}`, JSON.stringify(plan));
-    await kvSet(`order:used:${orderId}`, "1");
+    await kvSet(`order:used:${orderNo}`, "1");
 
     const planName = plan.type===PLAN.TRIAL ? "お試し（1購入=1質問）"
                     : plan.type===PLAN.UNLIMITED ? "1日無制限（当日23:59まで）"
@@ -167,8 +174,7 @@ async function handleEvent(event) {
 
   // お試し：1購入=1回答ガード
   if (st.type === PLAN.TRIAL) {
-    // コマンド類は消費扱いにしない
-    const isCommand = ["メニュー","/menu","menu","help","？","?","リセット","/reset","reset","認証"]
+    const isCommand = ["メニュー","/menu","menu","help","？","?","リセット","/reset","reset","認証","認識","注文","order","コード"]
       .some(k => text.includes(k));
     const consumedKey = `trial:consumed:${userId}:${st.orderId}`;
     const consumed = await kvGet(consumedKey);
@@ -209,35 +215,89 @@ async function saveSession(userId, hist){
   await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
 }
 
-// ========= STORES API =========
-async function fetchStoresOrder(orderId){
-  if (!STORES_API_KEY) return null;
-  try {
-    // 注文番号直接参照の想定エンドポイント（必要に応じて調整）
-    const url = `${STORES_API_BASE.replace(/\/$/,"")}/v1/orders/${encodeURIComponent(orderId)}`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${STORES_API_KEY}` }});
-    if (!r.ok) { console.error("STORES", r.status, await r.text()); return null; }
-    return await r.json(); // 例：{ id, status, items:[{sku,title,quantity}], ... }
-  } catch(e){ console.error("stores api err:", e); return null; }
+// ========= STORES API（注文番号検索＋ID直参照／Bearer & X-API-KEY 両対応／詳細ログ） =========
+async function fetchStoresOrder(orderInput) {
+  if (!STORES_API_KEY) {
+    console.log("❌ STORES_API_KEY 未設定");
+    return null;
+  }
+  const base = STORES_API_BASE;
+  const headersList = [
+    { Authorization: `Bearer ${STORES_API_KEY}` },
+    { "X-API-KEY": STORES_API_KEY },
+  ];
+
+  console.log("🟡 [AUTH try] 注文番号:", orderInput, "BASE:", base);
+
+  const tryFetch = async (url) => {
+    for (const h of headersList) {
+      try {
+        const r = await fetch(url, { headers: h });
+        const text = await r.text();
+        if (r.ok) {
+          console.log("✅ STORES応答成功:", url);
+          return JSON.parse(text);
+        } else {
+          console.log("⚠️ STORES応答:", r.status, url, text.slice(0, 180));
+        }
+      } catch (e) {
+        console.log("❌ STORES fetch err:", url, e.message || e);
+      }
+    }
+    return null;
+  };
+
+  // 1) 注文番号(number)での検索
+  const qs = encodeURIComponent(orderInput);
+  let list = await tryFetch(`${base}/v1/orders?number=${qs}`);
+  if (!list) list = await tryFetch(`${base}/v1/orders?order_number=${qs}`);
+
+  if (list?.orders?.length) {
+    const hit = list.orders.find(o => (o.number || o.order_number || "").toString() === orderInput.toString());
+    if (hit) {
+      console.log("✅ 注文番号ヒット:", hit.number || hit.order_number);
+      return hit;
+    }
+  }
+
+  // 2) 内部ID直指定（万一、番号ではなくIDが来た場合）
+  const one = await tryFetch(`${base}/v1/orders/${qs}`);
+  if (one && (one.id || one.number || one.order_number)) {
+    console.log("✅ IDヒット:", one.id);
+    return one;
+  }
+
+  console.log("❌ 注文が見つかりません:", orderInput);
+  return null;
 }
+
 function isPaid(order){
-  const s = (order?.status||"").toLowerCase();
-  return ["paid","authorized","captured","settled"].some(x=>s.includes(x));
+  const s = String(order?.status || "").toLowerCase();
+  const ok = ["paid","authorized","captured","settled","paid_and_shipped"].some(x => s.includes(x));
+  console.log("🔎 支払い状態:", s, "→", ok ? "有効" : "未決済");
+  return ok;
 }
+
 function inferPlan(order){
-  const items = order?.items || [];
-  const skuConcat = items.map(it=>(it.sku||"")+":"+(it.title||"")).join(" ").toUpperCase();
+  const items = order?.items || order?.line_items || [];
+  const skuConcat = items.map(it => `${it.sku || ""}:${it.title || it.name || ""}`).join(" ").toUpperCase();
+
+  console.log("🧾 購入商品:", skuConcat);
 
   // SKU/タイトルに含めておくと判定が堅い： TRIAL-500 / DAY-1500 / SUB-3000
-  if (/\bTRIAL-500\b/.test(skuConcat) || /お試し/i.test(skuConcat)) {
-    return { type: PLAN.TRIAL, orderId: order.id, expireAt: 0 };
+  if (/\bTRIAL-500\b/.test(skuConcat) || /お試し/.test(skuConcat)) {
+    console.log("🎯 お試しプラン検出");
+    return { type: PLAN.TRIAL, orderId: order.id || order.number || order.order_number, expireAt: 0 };
   }
-  if (/\bDAY-1500\b/.test(skuConcat) || /無制限|1日/i.test(skuConcat)) {
-    return { type: PLAN.UNLIMITED, orderId: order.id, expireAt: endOfTodayTs() };
+  if (/\bDAY-1500\b/.test(skuConcat) || /(無制限|1日)/.test(skuConcat)) {
+    console.log("🎯 1日プラン検出");
+    return { type: PLAN.UNLIMITED, orderId: order.id || order.number || order.order_number, expireAt: endOfTodayTs() };
   }
-  if (/\bSUB-3000\b/.test(skuConcat) || /定期|月額/i.test(skuConcat)) {
-    return { type: PLAN.MONTHLY, orderId: order.id, expireAt: 0 };
+  if (/\bSUB-3000\b/.test(skuConcat) || /(定期|月額)/.test(skuConcat)) {
+    console.log("🎯 月額プラン検出");
+    return { type: PLAN.MONTHLY, orderId: order.id || order.number || order.order_number, expireAt: 0 };
   }
+  console.log("⚠️ プラン不明: マッチなし");
   return null;
 }
 
