@@ -1,5 +1,4 @@
 // index.js — 購入者限定 / STORES注文認証 / Redis永続 / 3プラン対応（完全版）
-const APP_REV = "rev-2025-10-12-22:10"; console.log("[BOOT]", APP_REV);
 
 import express from "express";
 import fetch from "node-fetch";
@@ -8,16 +7,14 @@ import { Client, middleware } from "@line/bot-sdk";
 
 /* ========= 環境変数 =========
 LINE_ACCESS_TOKEN, LINE_CHANNEL_SECRET
-OPENAI_API_KEY, MODEL (推奨: gpt-4o-mini)
+OPENAI_API_KEY, MODEL
 
 STORES_API_BASE  (例: https://api.stores.jp)
-STORES_API_KEY   (読み取り用APIキー)  ※Bearer / X-API-KEY の両方対応
+STORES_API_KEY   (読み取り用APIキー)  ※Bearer or X-API-KEY どちらでも
 
-REDIS_URL  (Upstash REST URL)
-REDIS_TOKEN(Upstash REST TOKEN)
-
-STORE_URL  (購入ページURLを案内で表示)
-PORT       (Renderは 10000 を推奨)
+REDIS_URL, REDIS_TOKEN  (Upstash REST)
+STORE_URL
+PORT (Render推奨: 10000)
 ============================ */
 
 const config = {
@@ -33,10 +30,13 @@ const STORES_API_KEY  = process.env.STORES_API_KEY || "";
 const REDIS_URL   = process.env.REDIS_URL || "";
 const REDIS_TOKEN = process.env.REDIS_TOKEN || "";
 
+const APP_REV = "rev-2025-10-12-2215";
+console.log("[BOOT]", APP_REV);
+
 const app = express();
 const client = new Client(config);
 
-// ========= 収納（Redisラッパ / フォールバックなし：本番は必須） ==========
+// ========= Redisラッパ =========
 async function kvGet(key) {
   if (!REDIS_URL || !REDIS_TOKEN) return null;
   const r = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
@@ -60,46 +60,48 @@ async function kvDel(key) {
   });
 }
 
-// ========= 文字列 ==========
+// ========= 文言 =========
 const PURCHASE_ONLY_MESSAGE =
-  `🔒 この占いサービスはご購入者限定です
+`🔒 この占いサービスはご購入者限定です
 
 Beauty Oneの公式ストアでプランをご購入後、
 購入完了画面に表示の【注文番号】を
 このLINEに「認証 注文番号」の形式で送信してください。
 
 🪄 プラン一覧
-・お試し鑑定（1購入=1質問）¥500  ※何度でも再購入OK
+・お試し鑑定（1購入=1質問）¥500
 ・1日無制限チャット占い ¥1,500（当日23:59まで）
 ・定期鑑定（月額）¥3,000
 
 🔗 ご購入はこちら 👉 ${STORE_URL}`;
 
 const TRIAL_REPURCHASE_MSG =
-  "お試し鑑定は 1購入につき1質問までとなります。何度でも再購入いただけます。ご購入後、表示される【注文番号】を「認証 注文番号」で送信すると鑑定が開始されます。";
+"お試し鑑定は 1購入につき1質問です。再度ご利用の際はご購入後、表示される【注文番号】を「認証 注文番号」で送ってください。";
 
 const HELP_MSG =
-  `使い方：
+`使い方：
 1) ストアで購入 → 注文番号を取得
-2) LINEで「認証 1234ABCD」のように送信
+2) LINEで「認証 1234ABCD」と送信
 3) 有効化後にご相談内容を送信
 
 🔗 購入：${STORE_URL}`;
 
-// ========= プラン定義 =========
+// ========= プラン =========
 const PLAN = { NONE:"none", TRIAL:"trial", UNLIMITED:"unlimited", MONTHLY:"monthly" };
-function endOfTodayTs() { return dayjs().endOf("day").valueOf(); }
+function endOfTodayTs(){ return dayjs().endOf("day").valueOf(); }
 
 // ========= ヘルス系 =========
 app.get("/health", (_,res)=>res.status(200).send("healthy"));
-app.get("/", (_,res)=>res.status(200).send("OK"));
-app.get("/env", (req,res)=>{
+app.get("/",       (_,res)=>res.status(200).send("OK"));
+app.get("/env",    (req,res)=>{
   const OPENAI = !!process.env.OPENAI_API_KEY;
-  res.status(200).json({ MODEL, OPENAI, STORE_URL, STORES_API_BASE, REDIS: !!REDIS_URL });
+  res.status(200).json({ MODEL, OPENAI, STORE_URL, STORES_API_BASE, REDIS: !!REDIS_URL, APP_REV });
 });
 app.get("/ping-llm", async (_, res) => {
-  try { const msg = await generateWithOpenAI("テスト鑑定を一文で。", []); res.status(200).send(msg?`LLM ok: ${msg.slice(0,60)}`:"LLM fallback"); }
-  catch(e){ res.status(500).send("LLM error: " + (e.message||e)); }
+  try {
+    const msg = await generateWithOpenAI("テスト鑑定を一文で。", []);
+    res.status(200).send(msg ? `LLM ok: ${msg.slice(0,60)}` : "LLM fallback");
+  } catch(e){ res.status(500).send("LLM error: " + (e.message||e)); }
 });
 
 // ========= Webhook =========
@@ -114,21 +116,21 @@ app.post("/webhook", middleware(config), async (req, res) => {
   }
 });
 
-async function handleEvent(event) {
+async function handleEvent(event){
   if (event.type !== "message" || event.message.type !== "text") return;
   const userId = event.source.userId;
   const text = (event.message.text || "").trim();
 
-  // メニュー/ヘルプ
+  // メニュー
   if (["メニュー","/menu","menu","help","？","?"].includes(text)) {
     return reply(event, HELP_MSG);
   }
   if (["リセット","/reset","reset"].includes(text)) {
     await kvDel(`sess:${userId}`);
-    return reply(event,"会話履歴をリセットしました。ご相談内容をどうぞ。");
+    return reply(event, "会話履歴をリセットしました。ご相談内容をどうぞ。");
   }
 
-  // ========== 認証（注文番号）：「認証 <ORDER_NO>」 他、少しゆるく ==========
+  // ========== 認証（注文番号） ==========
   const auth = text.match(/^(?:認証|認識|注文|コード|order)\s+([A-Za-z0-9\-_]{5,})$/i);
   const justOrder = !auth && text.match(/^([A-Za-z0-9\-_]{6,})$/);
   if (justOrder) {
@@ -136,18 +138,81 @@ async function handleEvent(event) {
   }
 
   if (auth) {
-    const orderNo = auth[1];                    // ← ここを使う
+    const orderNo = auth[1];
     const used = await kvGet(`order:used:${orderNo}`);
     if (used === "1") {
       return reply(event, "この注文番号はすでに使用済みです。ご不明点はサポートまで。");
     }
-// ========= STORES API（修正版：検索API＋ID直参照 / JSON強制 / 両方式Auth） =========
+
+    const order = await fetchStoresOrder(orderNo); // ← 重要：orderNo を渡す
+    if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
+    if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
+
+    const plan = inferPlan(order);
+    if (!plan) return reply(event, "商品が特定できませんでした。サポートまでご連絡ください。");
+
+    await kvSet(`user:plan:${userId}`, JSON.stringify(plan));
+    await kvSet(`order:used:${orderNo}`, "1");
+
+    const planName = plan.type===PLAN.TRIAL ? "お試し（1購入=1質問）"
+                    : plan.type===PLAN.UNLIMITED ? "1日無制限（当日23:59まで）"
+                    : "月額定期";
+    return reply(event, `✅ 購入を確認しました。${planName}を有効化しました。\nご相談内容を送信してください。`);
+  }
+
+  // ========== 利用権チェック ==========
+  const stRaw = await kvGet(`user:plan:${userId}`);
+  if (!stRaw) return reply(event, PURCHASE_ONLY_MESSAGE);
+  const st = JSON.parse(stRaw);
+
+  if (st.expireAt && Date.now() > st.expireAt) {
+    await kvDel(`user:plan:${userId}`);
+    return reply(event, "プランの有効期限が切れました。\n" + PURCHASE_ONLY_MESSAGE);
+  }
+
+  // お試し：1購入=1回答ガード
+  if (st.type === PLAN.TRIAL) {
+    const isCommand = ["メニュー","/menu","menu","help","？","?","リセット","/reset","reset","認証","認識","注文","order","コード"]
+      .some(k => text.includes(k));
+    const consumedKey = `trial:consumed:${userId}:${st.orderId}`;
+    const consumed = await kvGet(consumedKey);
+    if (consumed === "1") return reply(event, TRIAL_REPURCHASE_MSG);
+    if (isCommand) return reply(event, "お試しは1購入につき1質問です。占いたい内容を1つだけ送ってください。");
+  }
+
+  // ========== 鑑定フロー ==========
+  const hist = await loadSession(userId);
+  hist.push({ role:"user", content:text });
+  while (hist.length > 10) hist.shift();
+
+  const name = await safeName(userId);
+  const prompt = buildPrompt(name, hist);
+  const answer = await generateWithOpenAI(prompt, hist) || fallbackReply();
+
+  hist.push({ role:"assistant", content:answer });
+  await saveSession(userId, hist);
+
+  if (st.type === PLAN.TRIAL) {
+    await kvSet(`trial:consumed:${userId}:${st.orderId}`,"1");
+  }
+  return reply(event, answer.slice(0, 4900));
+}
+
+// ========= セッション保存 =========
+async function loadSession(userId){
+  const raw = await kvGet(`sess:${userId}`);
+  return raw ? JSON.parse(raw) : [];
+}
+async function saveSession(userId, hist){
+  await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
+}
+
+// ========= STORES API（検索API＋ID直参照 / JSON強制 / 両方式Auth） =========
 async function fetchStoresOrder(orderInput) {
   if (!STORES_API_KEY) {
     console.log("❌ STORES_API_KEY 未設定");
     return null;
   }
-
   const base = STORES_API_BASE;
   const headersList = [
     { Authorization: `Bearer ${STORES_API_KEY}`, Accept: "application/json" },
@@ -177,7 +242,7 @@ async function fetchStoresOrder(orderInput) {
     return null;
   };
 
-  // ✅ 注文番号で検索（/search）
+  // ✅ 注文番号で検索
   const q = encodeURIComponent(orderInput);
   let list = await tryFetch(`${base}/v1/orders/search?query=${q}`);
 
@@ -191,7 +256,7 @@ async function fetchStoresOrder(orderInput) {
     }
   }
 
-  // ✅ 内部ID直指定 fallback（番号がそのままIDだった場合に備え）
+  // ✅ 内部ID直指定のフォールバック
   const one = await tryFetch(`${base}/v1/orders/${q}`);
   if (one && (one.id || one.number || one.order_number)) {
     console.log("✅ IDヒット:", one.id);
@@ -201,7 +266,6 @@ async function fetchStoresOrder(orderInput) {
   console.log("❌ 注文が見つかりません:", orderInput);
   return null;
 }
-
 
 function isPaid(order){
   const s = String(order?.status || "").toLowerCase();
@@ -289,8 +353,9 @@ function fallbackReply(){
 }
 function reply(event, text){ return client.replyMessage(event.replyToken, { type:"text", text }); }
 
-// Renderは10000推奨
+// ===== 起動 =====
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
 
 
