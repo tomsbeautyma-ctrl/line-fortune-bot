@@ -1,20 +1,21 @@
-// index.js — 購入者限定 / STORES注文認証 / Redis永続 / 3プラン対応（完全版）
+// index.js — STORES注文認証 / Redis永続 / 3プラン対応（完全版・2025-10-12修正）
 
 import express from "express";
 import fetch from "node-fetch";
 import dayjs from "dayjs";
 import { Client, middleware } from "@line/bot-sdk";
 
-/* ========= 環境変数 =========
+/* ========= 必要な環境変数 =========
 LINE_ACCESS_TOKEN, LINE_CHANNEL_SECRET
 OPENAI_API_KEY, MODEL
 
-STORES_API_BASE  (例: https://api.stores.jp)
-STORES_API_KEY   (読み取り用APIキー)  ※Bearer or X-API-KEY どちらでも
+// ★ここが超重要（公式の受注APIベースURL）
+STORES_API_BASE=https://api.stores.dev/retail/202211
+STORES_API_KEY  （読み取り用APIキー：Bearer でも X-API-KEY でもOK）
 
-REDIS_URL, REDIS_TOKEN  (Upstash REST)
+REDIS_URL, REDIS_TOKEN (Upstash REST)
 STORE_URL
-PORT (Render推奨: 10000)
+PORT（Render推奨: 10000）
 ============================ */
 
 const config = {
@@ -24,13 +25,14 @@ const config = {
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 const STORE_URL = process.env.STORE_URL || "https://beauty-one.stores.jp";
 
-const STORES_API_BASE = (process.env.STORES_API_BASE || "https://api.stores.jp").replace(/\/$/, "");
+// ★デフォルトも api.stores.dev/retail/202211 に変更
+const STORES_API_BASE = (process.env.STORES_API_BASE || "https://api.stores.dev/retail/202211").replace(/\/$/, "");
 const STORES_API_KEY  = process.env.STORES_API_KEY || "";
 
 const REDIS_URL   = process.env.REDIS_URL || "";
 const REDIS_TOKEN = process.env.REDIS_TOKEN || "";
 
-const APP_REV = "rev-2025-10-12-2215";
+const APP_REV = "rev-2025-10-12-2236";
 console.log("[BOOT]", APP_REV);
 
 const app = express();
@@ -121,7 +123,6 @@ async function handleEvent(event){
   const userId = event.source.userId;
   const text = (event.message.text || "").trim();
 
-  // メニュー
   if (["メニュー","/menu","menu","help","？","?"].includes(text)) {
     return reply(event, HELP_MSG);
   }
@@ -144,7 +145,7 @@ async function handleEvent(event){
       return reply(event, "この注文番号はすでに使用済みです。ご不明点はサポートまで。");
     }
 
-    const order = await fetchStoresOrder(orderNo); // ← 重要：orderNo を渡す
+    const order = await fetchStoresOrder(orderNo);   // ← ここで本物APIに問い合わせ
     if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
     if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
 
@@ -207,16 +208,18 @@ async function saveSession(userId, hist){
   await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
 }
 
-// ========= STORES API（検索API＋ID直参照 / JSON強制 / 両方式Auth） =========
+// ========= STORES API（正式版：/retail/202211/orders?numbers=XXX） =========
 async function fetchStoresOrder(orderInput) {
   if (!STORES_API_KEY) {
     console.log("❌ STORES_API_KEY 未設定");
     return null;
   }
-  const base = STORES_API_BASE;
+  const base = STORES_API_BASE; // 例: https://api.stores.dev/retail/202211
+
+  // Bearer / X-API-KEY の両対応
   const headersList = [
     { Authorization: `Bearer ${STORES_API_KEY}`, Accept: "application/json" },
-    { "X-API-KEY": STORES_API_KEY,           Accept: "application/json" },
+    { "X-API-KEY": STORES_API_KEY,               Accept: "application/json" },
   ];
 
   console.log("🟡 [AUTH try] 注文番号:", orderInput, "BASE:", base);
@@ -242,9 +245,9 @@ async function fetchStoresOrder(orderInput) {
     return null;
   };
 
-  // ✅ 注文番号で検索
-  const q = encodeURIComponent(orderInput);
-  let list = await tryFetch(`${base}/v1/orders/search?query=${q}`);
+  // ✅ 正式な検索（注文番号）※複数指定も可（numbers=1,2,3）
+  const q = encodeURIComponent(String(orderInput));
+  let list = await tryFetch(`${base}/orders?numbers=${q}`);
 
   if (list?.orders?.length) {
     const hit = list.orders.find(o =>
@@ -256,11 +259,11 @@ async function fetchStoresOrder(orderInput) {
     }
   }
 
-  // ✅ 内部ID直指定のフォールバック
-  const one = await tryFetch(`${base}/v1/orders/${q}`);
-  if (one && (one.id || one.number || one.order_number)) {
-    console.log("✅ IDヒット:", one.id);
-    return one;
+  // ✅ 念のため：内部IDで直取得も試す
+  const byId = await tryFetch(`${base}/orders/${q}`);
+  if (byId && (byId.id || byId.number || byId.order_number)) {
+    console.log("✅ IDヒット:", byId.id);
+    return byId;
   }
 
   console.log("❌ 注文が見つかりません:", orderInput);
@@ -268,7 +271,8 @@ async function fetchStoresOrder(orderInput) {
 }
 
 function isPaid(order){
-  const s = String(order?.status || "").toLowerCase();
+  const s = String(order?.paid_status || order?.status || "").toLowerCase();
+  // 旧/新ステータスの両方を許容
   const ok = ["paid","authorized","captured","settled","paid_and_shipped"].some(x => s.includes(x));
   console.log("🔎 支払い状態:", s, "→", ok ? "有効" : "未決済");
   return ok;
