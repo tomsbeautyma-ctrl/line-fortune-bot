@@ -1,15 +1,13 @@
 {
   "name": "beautyone-fortune-linebot",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "@line/bot-sdk": "^9.0.0",
+    "dayjs": "^1.11.13",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "dayjs": "^1.11.13"
+    "node-fetch": "^3.3.2"
   },
   "engines": { "node": ">=18" }
 }
