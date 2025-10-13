@@ -235,9 +235,9 @@ async function fetchStoresOrder(orderNumber) {
   }
 }
 
-// ========= 支払い判定（配列・ネスト対応の決定版） =========
-function isPaid(order){
-  // 1) トップレベル文字列系（あればそのまま判定）
+// ========= 支払い判定（STORES Retail対応・paid_at検出版） =========
+function isPaid(order) {
+  // トップレベル候補
   const candidates = [
     String(order?.paid_status ?? ""),
     String(order?.payment_status ?? ""),
@@ -245,66 +245,32 @@ function isPaid(order){
     String(order?.financial_status ?? ""),
   ].map(s => s.toLowerCase()).filter(Boolean);
 
-  // 2) 真偽フラグ系
-  const flagPaid = (order?.paid === true) || (order?.is_paid === true);
+  // 真偽系
+  const flagPaid = order?.paid === true || order?.is_paid === true;
 
-  // 3) ネスト内配列（API実装によってはここに入る）
-  //   - payments[].status / payments[].paid / payments[].captured
-  //   - transactions[].status
-  //   - charges[].status / charges[].captured / charges[].paid
-  const collectNest = [];
+  // payments配列に paid_at があるか？
+  const paidAtFromPayments = Array.isArray(order?.payments)
+    ? order.payments.map(p => p?.paid_at).filter(Boolean)
+    : [];
 
-  const pushStatuses = (ary, pickers) => {
-    if (!Array.isArray(ary)) return;
-    for (const x of ary) {
-      for (const p of pickers) {
-        const v = p(x);
-        if (v !== undefined && v !== null && v !== "") collectNest.push(String(v).toLowerCase());
-      }
-    }
-  };
-
-  pushStatuses(order?.payments, [
-    x => x?.status, x => x?.paid, x => x?.is_paid, x => x?.captured, x => x?.result, x => x?.state
-  ]);
-  pushStatuses(order?.transactions, [
-    x => x?.status, x => x?.result, x => x?.state
-  ]);
-  pushStatuses(order?.charges, [
-    x => x?.status, x => x?.paid, x => x?.captured, x => x?.outcome
-  ]);
-
-  // タイムスタンプがあれば強い根拠
-  const paidAtHints = [
-    order?.paid_at, order?.captured_at, order?.settled_at,
-    ...(Array.isArray(order?.payments) ? order.payments.map(x=>x?.paid_at||x?.captured_at).filter(Boolean) : []),
-  ];
-  const hasPaidTimestamp = paidAtHints.some(Boolean);
-
-  // 受領済みとみなす語彙（必要ならここに追加）
-  const okWords = [
-    "paid","authorized","captured","settled","paid_and_shipped",
-    "payment_completed","completed","succeeded","success","ok"
-  ];
-
-  const textHit =
-    candidates.some(s => okWords.some(w => s.includes(w))) ||
-    collectNest.some(s => {
-      if (s === "true") return true;               // boolean→文字列化
-      return okWords.some(w => s.includes(w));
-    });
-
-  const ok = flagPaid || hasPaidTimestamp || textHit;
+  // 最終的に決済済みと判断できる条件
+  const ok =
+    flagPaid ||
+    paidAtFromPayments.length > 0 ||
+    candidates.some(s => ["paid", "completed", "succeeded"].some(w => s.includes(w)));
 
   console.log("🔎 支払いフィールド:", {
-    topLevel: { paid_status: order?.paid_status, payment_status: order?.payment_status, status: order?.status, financial_status: order?.financial_status, paid: order?.paid, is_paid: order?.is_paid },
-    nestSample: {
-      payments0: Array.isArray(order?.payments) ? order.payments[0] : undefined,
-      transactions0: Array.isArray(order?.transactions) ? order.transactions[0] : undefined,
-      charges0: Array.isArray(order?.charges) ? order.charges[0] : undefined,
-    },
-    paidAtHints
-  }, "→", ok ? "有効" : "未決済");
+    paid_status: order?.paid_status,
+    payment_status: order?.payment_status,
+    status: order?.status,
+    paid: order?.paid,
+    is_paid: order?.is_paid,
+    payments: order?.payments?.map(p => ({
+      type: p?.type,
+      amount: p?.amount,
+      paid_at: p?.paid_at,
+    })),
+  }, "→", ok ? "有効（決済済）" : "未決済");
 
   return ok;
 }
@@ -389,5 +355,6 @@ function reply(event, text){ return client.replyMessage(event.replyToken, { type
 // ===== 起動 =====
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
 
 
