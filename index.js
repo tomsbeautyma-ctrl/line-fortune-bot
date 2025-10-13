@@ -199,46 +199,55 @@ async function saveSession(userId, hist){
   await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
 }
 
-// ========= STORES API（Retail 202211 / Bearer / numbers検索） =========
+// ========= STORES API（詳細取得つき） =========
 async function fetchStoresOrder(orderNumber) {
-  if (!STORES_API_KEY) {
-    console.log("❌ STORES_API_KEY 未設定");
-    return null;
-  }
+  if (!STORES_API_KEY) { console.log("❌ STORES_API_KEY 未設定"); return null; }
+
   const headers = { Authorization: `Bearer ${STORES_API_KEY}`, Accept: "application/json" };
   const q = encodeURIComponent(String(orderNumber));
-  const url = `${STORES_API_BASE}/orders?numbers=${q}`;
 
-  console.log("➡️ fetch:", url, "headers:", Object.keys(headers).join(","));
-  try {
-    const r = await fetch(url, { headers });
-    const text = await r.text();
-    const ctype = r.headers.get("content-type") || "";
-    if (!r.ok || !ctype.includes("application/json")) {
-      console.log("⚠️ STORES応答:", r.status, url, "ctype:", ctype, "body:", text.slice(0, 140));
-      return null;
-    }
-    const data = JSON.parse(text);
-    const order = data?.orders?.find(o => String(o.number || o.order_number) === String(orderNumber)) || null;
-    if (order) console.log("✅ 注文番号ヒット:", order.number || order.order_number || order.id);
-    else console.log("❌ 注文が見つかりません:", orderNumber);
-    console.log("🧾 order keys:", Object.keys(order || {}));
-    // デバッグ：主要フィールドを一度だけ確認したい時はコメント解除
-    // console.log("🧾 受信した注文サマリ:", {
-    //   number: order?.number, paid_status: order?.paid_status, payment_status: order?.payment_status,
-    //   status: order?.status, financial_status: order?.financial_status, paid: order?.paid, is_paid: order?.is_paid,
-    //   items_len: (order?.items || order?.line_items || []).length,
-    // });
-    return order;
-  } catch (e) {
-    console.log("❌ STORES fetch err:", e.message || e);
+  // 1) 番号で一覧ヒット
+  const listUrl = `${STORES_API_BASE}/orders?numbers=${q}`;
+  console.log("➡️ fetch(list):", listUrl);
+  const listRes = await fetch(listUrl, { headers });
+  const listTxt = await listRes.text();
+  if (!listRes.ok) {
+    console.log("⚠️ STORES応答(list):", listRes.status, listUrl, listTxt.slice(0,150));
     return null;
   }
+  let list;
+  try { list = JSON.parse(listTxt); } catch { list = null; }
+  const hit = list?.orders?.find(o => String(o.number||o.order_number) === String(orderNumber));
+  if (!hit) { console.log("❌ 注文が見つかりません:", orderNumber); return null; }
+
+  const orderId = hit.id || hit.order_id || hit.number || hit.order_number;
+  console.log("✅ 注文番号ヒット:", orderNumber, "→ id:", orderId);
+
+  // 2) IDで詳細取得（ここに payments/transactions が入る想定）
+  const detailUrl = `${STORES_API_BASE}/orders/${encodeURIComponent(String(orderId))}`;
+  console.log("➡️ fetch(detail):", detailUrl);
+  const detRes = await fetch(detailUrl, { headers });
+  const detTxt = await detRes.text();
+  if (!detRes.ok) {
+    console.log("⚠️ STORES応答(detail):", detRes.status, detailUrl, detTxt.slice(0,150));
+    // 一覧のヒットだけでも返す（最低限の情報）
+    return hit;
+  }
+  let detail;
+  try { detail = JSON.parse(detTxt); } catch { detail = null; }
+
+  // 3) 詳細が order 直で返る or 包装されて返る両対応
+  const full = detail?.order || detail || hit;
+
+  // デバッグ（一度だけでOKなら適宜コメントアウト）
+  console.log("🧾 order keys:", Object.keys(full || {}));
+  return full;
 }
 
-// ========= 支払い判定（STORES Retail対応・paid_at検出版） =========
+
+// ========= 支払い判定（詳細フィールド網羅） =========
 function isPaid(order) {
-  // トップレベル候補
+  // トップレベル候補（あれば使う）
   const candidates = [
     String(order?.paid_status ?? ""),
     String(order?.payment_status ?? ""),
@@ -246,35 +255,53 @@ function isPaid(order) {
     String(order?.financial_status ?? ""),
   ].map(s => s.toLowerCase()).filter(Boolean);
 
-  // 真偽系
   const flagPaid = order?.paid === true || order?.is_paid === true;
 
-  // payments配列に paid_at があるか？
+  // payments[].paid_at
   const paidAtFromPayments = Array.isArray(order?.payments)
     ? order.payments.map(p => p?.paid_at).filter(Boolean)
     : [];
 
-  // 最終的に決済済みと判断できる条件
+  // transactions[].status / transactions[].paid_at など
+  const tStatuses = Array.isArray(order?.transactions)
+    ? order.transactions.flatMap(t => [
+        String(t?.status ?? "").toLowerCase(),
+        String(t?.result ?? "").toLowerCase(),
+        String(t?.state ?? "").toLowerCase(),
+      ].filter(Boolean))
+    : [];
+
+  const tPaidAt = Array.isArray(order?.transactions)
+    ? order.transactions.map(t => t?.paid_at || t?.captured_at || t?.settled_at).filter(Boolean)
+    : [];
+
+  // 金額・ステータス系ヒント
+  const hasPaymentAmount = typeof order?.payment_amount === "number" && order.payment_amount > 0;
+  const hasReadiedAt = !!order?.readied_at; // 受注確定/支払確認後に立つケースがある
+
+  const okWords = ["paid","authorized","captured","settled","paid_and_shipped","payment_completed","completed","succeeded","success","ok"];
+
+  const textHit =
+    candidates.some(s => okWords.some(w => s.includes(w))) ||
+    tStatuses.some(s => okWords.some(w => s.includes(w)));
+
   const ok =
     flagPaid ||
     paidAtFromPayments.length > 0 ||
-    candidates.some(s => ["paid", "completed", "succeeded"].some(w => s.includes(w)));
+    tPaidAt.length > 0 ||
+    hasPaymentAmount ||
+    hasReadiedAt ||
+    textHit;
 
   console.log("🔎 支払いフィールド:", {
-    paid_status: order?.paid_status,
-    payment_status: order?.payment_status,
-    status: order?.status,
-    paid: order?.paid,
-    is_paid: order?.is_paid,
-    payments: order?.payments?.map(p => ({
-      type: p?.type,
-      amount: p?.amount,
-      paid_at: p?.paid_at,
-    })),
+    candidates, flagPaid, hasPaymentAmount, readied_at: order?.readied_at,
+    payments0: Array.isArray(order?.payments) ? order.payments[0] : undefined,
+    transactions0: Array.isArray(order?.transactions) ? order.transactions[0] : undefined,
   }, "→", ok ? "有効（決済済）" : "未決済");
 
   return ok;
 }
+
 
 
 // ========= プラン判定 =========
@@ -356,6 +383,7 @@ function reply(event, text){ return client.replyMessage(event.replyToken, { type
 // ===== 起動 =====
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
 
 
 
