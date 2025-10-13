@@ -136,6 +136,7 @@ async function handleEvent(event){
     const order = await fetchStoresOrder(orderNo);
     if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
     if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
+console.log("🧾 order structure sample:", JSON.stringify(order, null, 2).slice(0, 2000));
 
     const plan = inferPlan(order);
     if (!plan) return reply(event, "商品が特定できませんでした。サポートまでご連絡ください。");
@@ -355,6 +356,7 @@ function reply(event, text){ return client.replyMessage(event.replyToken, { type
 // ===== 起動 =====
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
 
 
 
