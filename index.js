@@ -1,45 +1,42 @@
-// index.js — STORES注文認証 / Redis永続 / 3プラン対応（完全版・2025-10-12修正）
+// index.js — STORES購入者認証 + OpenAI占い（フル機能・2025-10-13）
 
 import express from "express";
 import fetch from "node-fetch";
 import dayjs from "dayjs";
 import { Client, middleware } from "@line/bot-sdk";
 
-/* ========= 必要な環境変数 =========
+/* ========= 必須環境変数 =========
 LINE_ACCESS_TOKEN, LINE_CHANNEL_SECRET
-OPENAI_API_KEY, MODEL
+OPENAI_API_KEY, MODEL (例: gpt-4o-mini)
 
-// ★ここが超重要（公式の受注APIベースURL）
-STORES_API_BASE=https://api.stores.dev/retail/202211
-STORES_API_KEY  （読み取り用APIキー：Bearer でも X-API-KEY でもOK）
+STORES_API_BASE  例: https://api.stores.dev/retail/202211
+STORES_API_KEY   （Bearer の中身。先頭に Bearer は付けない）
 
-REDIS_URL, REDIS_TOKEN (Upstash REST)
-STORE_URL
-PORT（Render推奨: 10000）
-============================ */
+REDIS_URL (Upstash REST URL), REDIS_TOKEN (REST TOKEN)
+STORE_URL  （購入導線の案内用URL）
+PORT       （Renderは 10000 を推奨）
+================================= */
 
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
+
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 const STORE_URL = process.env.STORE_URL || "https://beauty-one.stores.jp";
 
-// ★デフォルトも api.stores.dev/retail/202211 に変更
+// ★STORESは .dev/retail/202211 を既定に
 const STORES_API_BASE = (process.env.STORES_API_BASE || "https://api.stores.dev/retail/202211").replace(/\/$/, "");
 const STORES_API_KEY  = process.env.STORES_API_KEY || "";
 
 const REDIS_URL   = process.env.REDIS_URL || "";
 const REDIS_TOKEN = process.env.REDIS_TOKEN || "";
 
-const APP_REV = "rev-2025-10-12-2236";
-console.log("[BOOT]", APP_REV);
-
 const app = express();
 const client = new Client(config);
 
-// ========= Redisラッパ =========
-async function kvGet(key) {
+// ========= Redis（Upstash REST） =========
+async function kvGet(key){
   if (!REDIS_URL || !REDIS_TOKEN) return null;
   const r = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
@@ -47,18 +44,16 @@ async function kvGet(key) {
   if (!r.ok) return null;
   const j = await r.json(); return j?.result ?? null;
 }
-async function kvSet(key, val) {
+async function kvSet(key, val){
   if (!REDIS_URL || !REDIS_TOKEN) return;
   await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    method: "POST", headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
   });
 }
-async function kvDel(key) {
+async function kvDel(key){
   if (!REDIS_URL || !REDIS_TOKEN) return;
   await fetch(`${REDIS_URL}/del/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    method: "POST", headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
   });
 }
 
@@ -78,26 +73,18 @@ Beauty Oneの公式ストアでプランをご購入後、
 🔗 ご購入はこちら 👉 ${STORE_URL}`;
 
 const TRIAL_REPURCHASE_MSG =
-"お試し鑑定は 1購入につき1質問です。再度ご利用の際はご購入後、表示される【注文番号】を「認証 注文番号」で送ってください。";
-
-const HELP_MSG =
-`使い方：
-1) ストアで購入 → 注文番号を取得
-2) LINEで「認証 1234ABCD」と送信
-3) 有効化後にご相談内容を送信
-
-🔗 購入：${STORE_URL}`;
+  "お試し鑑定は 1購入につき1質問です。再度ご利用の際は再購入をお願いします。";
 
 // ========= プラン =========
 const PLAN = { NONE:"none", TRIAL:"trial", UNLIMITED:"unlimited", MONTHLY:"monthly" };
-function endOfTodayTs(){ return dayjs().endOf("day").valueOf(); }
+const endOfTodayTs = () => dayjs().endOf("day").valueOf();
 
 // ========= ヘルス系 =========
 app.get("/health", (_,res)=>res.status(200).send("healthy"));
 app.get("/",       (_,res)=>res.status(200).send("OK"));
 app.get("/env",    (req,res)=>{
   const OPENAI = !!process.env.OPENAI_API_KEY;
-  res.status(200).json({ MODEL, OPENAI, STORE_URL, STORES_API_BASE, REDIS: !!REDIS_URL, APP_REV });
+  res.status(200).json({ MODEL, OPENAI, STORE_URL, STORES_API_BASE, REDIS: !!REDIS_URL });
 });
 app.get("/ping-llm", async (_, res) => {
   try {
@@ -123,15 +110,16 @@ async function handleEvent(event){
   const userId = event.source.userId;
   const text = (event.message.text || "").trim();
 
+  // メニュー/リセット
   if (["メニュー","/menu","menu","help","？","?"].includes(text)) {
-    return reply(event, HELP_MSG);
+    return reply(event, `使い方：\n1) ストアで購入 → 注文番号を取得\n2) LINEで「認証 1234ABCD」\n3) 有効化後にご相談内容を送信\n\n🔗 購入：${STORE_URL}`);
   }
   if (["リセット","/reset","reset"].includes(text)) {
     await kvDel(`sess:${userId}`);
     return reply(event, "会話履歴をリセットしました。ご相談内容をどうぞ。");
   }
 
-  // ========== 認証（注文番号） ==========
+  // ========== 認証：「認証 <注文番号>」 ==========
   const auth = text.match(/^(?:認証|認識|注文|コード|order)\s+([A-Za-z0-9\-_]{5,})$/i);
   const justOrder = !auth && text.match(/^([A-Za-z0-9\-_]{6,})$/);
   if (justOrder) {
@@ -140,12 +128,12 @@ async function handleEvent(event){
 
   if (auth) {
     const orderNo = auth[1];
-    const used = await kvGet(`order:used:${orderNo}`);
-    if (used === "1") {
-      return reply(event, "この注文番号はすでに使用済みです。ご不明点はサポートまで。");
-    }
+    console.log(`🟡 [AUTH try] 注文番号: ${orderNo} BASE: ${STORES_API_BASE}`);
 
-    const order = await fetchStoresOrder(orderNo);   // ← ここで本物APIに問い合わせ
+    const used = await kvGet(`order:used:${orderNo}`);
+    if (used === "1") return reply(event, "この注文番号はすでに使用済みです。");
+
+    const order = await fetchStoresOrder(orderNo);
     if (!order) return reply(event, "購入が確認できませんでした。注文番号をご確認ください。");
     if (!isPaid(order)) return reply(event, "お支払い未確認です。決済完了後に再度お試しください。");
 
@@ -166,6 +154,7 @@ async function handleEvent(event){
   if (!stRaw) return reply(event, PURCHASE_ONLY_MESSAGE);
   const st = JSON.parse(stRaw);
 
+  // 期限切れ
   if (st.expireAt && Date.now() > st.expireAt) {
     await kvDel(`user:plan:${userId}`);
     return reply(event, "プランの有効期限が切れました。\n" + PURCHASE_ONLY_MESSAGE);
@@ -181,7 +170,7 @@ async function handleEvent(event){
     if (isCommand) return reply(event, "お試しは1購入につき1質問です。占いたい内容を1つだけ送ってください。");
   }
 
-  // ========== 鑑定フロー ==========
+  // ========== 鑑定（OpenAI） ==========
   const hist = await loadSession(userId);
   hist.push({ role:"user", content:text });
   while (hist.length > 10) hist.shift();
@@ -193,6 +182,7 @@ async function handleEvent(event){
   hist.push({ role:"assistant", content:answer });
   await saveSession(userId, hist);
 
+  // お試しなら“消費”マーク
   if (st.type === PLAN.TRIAL) {
     await kvSet(`trial:consumed:${userId}:${st.orderId}`,"1");
   }
@@ -208,76 +198,71 @@ async function saveSession(userId, hist){
   await kvSet(`sess:${userId}`, JSON.stringify(hist.slice(-10)));
 }
 
-// ========= STORES API（正式版：/retail/202211/orders?numbers=XXX） =========
-async function fetchStoresOrder(orderInput) {
+// ========= STORES API（Retail 202211 / Bearer / numbers検索） =========
+async function fetchStoresOrder(orderNumber) {
   if (!STORES_API_KEY) {
     console.log("❌ STORES_API_KEY 未設定");
     return null;
   }
-  const base = STORES_API_BASE; // 例: https://api.stores.dev/retail/202211
+  const headers = { Authorization: `Bearer ${STORES_API_KEY}`, Accept: "application/json" };
+  const q = encodeURIComponent(String(orderNumber));
+  const url = `${STORES_API_BASE}/orders?numbers=${q}`;
 
-  // Bearer / X-API-KEY の両対応
-  const headersList = [
-    { Authorization: `Bearer ${STORES_API_KEY}`, Accept: "application/json" },
-    { "X-API-KEY": STORES_API_KEY,               Accept: "application/json" },
-  ];
-
-  console.log("🟡 [AUTH try] 注文番号:", orderInput, "BASE:", base);
-
-  const tryFetch = async (url) => {
-    for (const h of headersList) {
-      try {
-        console.log("➡️  fetch:", url, "headers:", Object.keys(h).join(","));
-        const r = await fetch(url, { headers: h });
-        const text = await r.text();
-        const ctype = r.headers.get("content-type") || "";
-        if (r.ok && ctype.includes("application/json")) {
-          const j = JSON.parse(text);
-          console.log("✅ STORES応答成功:", url);
-          return j;
-        } else {
-          console.log("⚠️ STORES応答:", r.status, url, "ctype:", ctype, "body:", text.slice(0, 140));
-        }
-      } catch (e) {
-        console.log("❌ STORES fetch err:", url, e.message || e);
-      }
+  console.log("➡️ fetch:", url, "headers:", Object.keys(headers).join(","));
+  try {
+    const r = await fetch(url, { headers });
+    const text = await r.text();
+    const ctype = r.headers.get("content-type") || "";
+    if (!r.ok || !ctype.includes("application/json")) {
+      console.log("⚠️ STORES応答:", r.status, url, "ctype:", ctype, "body:", text.slice(0, 140));
+      return null;
     }
+    const data = JSON.parse(text);
+    const order = data?.orders?.find(o => String(o.number || o.order_number) === String(orderNumber)) || null;
+    if (order) console.log("✅ 注文番号ヒット:", order.number || order.order_number || order.id);
+    else console.log("❌ 注文が見つかりません:", orderNumber);
+    // デバッグ：主要フィールドを一度だけ確認したい時はコメント解除
+    // console.log("🧾 受信した注文サマリ:", {
+    //   number: order?.number, paid_status: order?.paid_status, payment_status: order?.payment_status,
+    //   status: order?.status, financial_status: order?.financial_status, paid: order?.paid, is_paid: order?.is_paid,
+    //   items_len: (order?.items || order?.line_items || []).length,
+    // });
+    return order;
+  } catch (e) {
+    console.log("❌ STORES fetch err:", e.message || e);
     return null;
-  };
-
-  // ✅ 正式な検索（注文番号）※複数指定も可（numbers=1,2,3）
-  const q = encodeURIComponent(String(orderInput));
-  let list = await tryFetch(`${base}/orders?numbers=${q}`);
-
-  if (list?.orders?.length) {
-    const hit = list.orders.find(o =>
-      [o.number, o.order_number].some(v => String(v) === String(orderInput))
-    );
-    if (hit) {
-      console.log("✅ 注文番号ヒット:", hit.number || hit.order_number);
-      return hit;
-    }
   }
-
-  // ✅ 念のため：内部IDで直取得も試す
-  const byId = await tryFetch(`${base}/orders/${q}`);
-  if (byId && (byId.id || byId.number || byId.order_number)) {
-    console.log("✅ IDヒット:", byId.id);
-    return byId;
-  }
-
-  console.log("❌ 注文が見つかりません:", orderInput);
-  return null;
 }
 
+// ========= 支払い判定（強化版） =========
 function isPaid(order){
-  const s = String(order?.paid_status || order?.status || "").toLowerCase();
-  // 旧/新ステータスの両方を許容
-  const ok = ["paid","authorized","captured","settled","paid_and_shipped"].some(x => s.includes(x));
-  console.log("🔎 支払い状態:", s, "→", ok ? "有効" : "未決済");
+  const candidates = [
+    String(order?.paid_status || ""),
+    String(order?.payment_status || ""),
+    String(order?.status || ""),
+    String(order?.financial_status || ""),
+  ].map(s => s.toLowerCase());
+
+  const flagPaid = (order?.paid === true) || (order?.is_paid === true);
+
+  const okWords = [
+    "paid","authorized","captured","settled","paid_and_shipped",
+    "payment_completed","completed","succeeded"
+  ];
+
+  const okByText = candidates.some(s => okWords.some(w => s.includes(w)));
+  const ok = flagPaid || okByText;
+
+  console.log("🔎 支払いフィールド:", {
+    paid_status: order?.paid_status, payment_status: order?.payment_status,
+    status: order?.status, financial_status: order?.financial_status,
+    paid: order?.paid, is_paid: order?.is_paid
+  }, "→", ok ? "有効" : "未決済");
+
   return ok;
 }
 
+// ========= プラン判定 =========
 function inferPlan(order){
   const items = order?.items || order?.line_items || [];
   const skuConcat = items.map(it => `${it.sku || ""}:${it.title || it.name || ""}`).join(" ").toUpperCase();
@@ -285,15 +270,12 @@ function inferPlan(order){
   console.log("🧾 購入商品:", skuConcat);
 
   if (/\bTRIAL-500\b/.test(skuConcat) || /お試し/.test(skuConcat)) {
-    console.log("🎯 お試しプラン検出");
     return { type: PLAN.TRIAL, orderId: order.id || order.number || order.order_number, expireAt: 0 };
   }
   if (/\bDAY-1500\b/.test(skuConcat) || /(無制限|1日)/.test(skuConcat)) {
-    console.log("🎯 1日プラン検出");
     return { type: PLAN.UNLIMITED, orderId: order.id || order.number || order.order_number, expireAt: endOfTodayTs() };
   }
   if (/\bSUB-3000\b/.test(skuConcat) || /(定期|月額)/.test(skuConcat)) {
-    console.log("🎯 月額プラン検出");
     return { type: PLAN.MONTHLY, orderId: order.id || order.number || order.order_number, expireAt: 0 };
   }
   console.log("⚠️ プラン不明: マッチなし");
@@ -338,8 +320,7 @@ async function generateWithOpenAI(prompt, history){
       if (r.status===429){
         const t = await r.text();
         if (t.includes("insufficient_quota")) return "【お知らせ】鑑定枠が上限に達しています。時間を置いてお試しください。";
-        await new Promise(res=>setTimeout(res, 1200));
-        continue;
+        await new Promise(res=>setTimeout(res, 1200)); continue;
       }
       if (!r.ok) throw new Error(`OpenAI ${r.status} ${await r.text()}`);
       const data = await r.json();
