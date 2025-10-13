@@ -302,27 +302,78 @@ function isPaid(order) {
   return ok;
 }
 
-
-
-// ========= プラン判定 =========
+// ========= プラン判定（多層フィールド＋金額フォールバック） =========
 function inferPlan(order){
-  const items = order?.items || order?.line_items || [];
-  const skuConcat = items.map(it => `${it.sku || ""}:${it.title || it.name || ""}`).join(" ").toUpperCase();
+  // 1) 各所に散らばりがちな商品情報を片っ端から集める
+  const arrays = [
+    order?.items,
+    order?.line_items,
+    order?.order_items,
+    order?.products,
+    order?.details,
+  ].filter(Array.isArray);
 
-  console.log("🧾 購入商品:", skuConcat);
+  const texts = [];
+  const pushText = (v) => { if (!v) return; const s = String(v).trim(); if (s) texts.push(s); };
 
-  if (/\bTRIAL-500\b/.test(skuConcat) || /お試し/.test(skuConcat)) {
+  for (const arr of arrays) {
+    for (const it of arr) {
+      pushText(it?.sku);
+      pushText(it?.title); pushText(it?.name); pushText(it?.product_name);
+      pushText(it?.variant_name); pushText(it?.option_name);
+      if (it?.product) { pushText(it.product?.sku); pushText(it.product?.name); }
+      if (Array.isArray(it?.files)) for (const f of it.files) pushText(f?.name);
+      if (Array.isArray(it?.downloads)) for (const d of it.downloads) pushText(d?.name);
+    }
+  }
+  const skuConcat = texts.join(" ").toUpperCase();
+  console.log("📄 購入商品テキスト候補:", texts.slice(0,10)); // デバッグ用
+
+  // 2) よくある表記をマッチ
+  if (/\bTRIAL-500\b/.test(skuConcat) || /お試し|TRIAL|体験/.test(skuConcat) || /BEAUTYONE_CHAT_TRIAL/i.test(skuConcat)) {
     return { type: PLAN.TRIAL, orderId: order.id || order.number || order.order_number, expireAt: 0 };
   }
-  if (/\bDAY-1500\b/.test(skuConcat) || /(無制限|1日)/.test(skuConcat)) {
+  if (/\bDAY-1500\b/.test(skuConcat) || /(無制限|1日|UNLIMITED)/.test(skuConcat)) {
     return { type: PLAN.UNLIMITED, orderId: order.id || order.number || order.order_number, expireAt: endOfTodayTs() };
   }
-  if (/\bSUB-3000\b/.test(skuConcat) || /(定期|月額)/.test(skuConcat)) {
+  if (/\bSUB-3000\b/.test(skuConcat) || /(定期|月額|SUBSCRIPTION)/.test(skuConcat)) {
     return { type: PLAN.MONTHLY, orderId: order.id || order.number || order.order_number, expireAt: 0 };
   }
+
+  // 3) 金額フォールバック（税込み金額や payment_amount を参照）
+  const amounts = [];
+  const mayPush = v => { if (typeof v === "number" && isFinite(v)) amounts.push(v); };
+  mayPush(order?.payment_amount);
+  mayPush(order?.total_amount);
+  mayPush(order?.amount);
+  // items配下に単価がある場合の合計
+  for (const arr of arrays) {
+    let sum = 0, ok = false;
+    for (const it of arr) {
+      const qty = Number(it?.quantity ?? it?.qty ?? 1) || 1;
+      const price = Number(it?.price ?? it?.amount ?? it?.total) || 0;
+      if (price > 0) { sum += price * qty; ok = true; }
+    }
+    if (ok) amounts.push(sum);
+  }
+  const maxAmt = amounts.length ? Math.max(...amounts) : 0;
+  console.log("💰 金額候補:", amounts);
+
+  // だいたいの税込み帯で判定（必要なら調整）
+  if (maxAmt >= 400 && maxAmt <= 700) {
+    return { type: PLAN.TRIAL, orderId: order.id || order.number || order.order_number, expireAt: 0 };
+  }
+  if (maxAmt >= 1200 && maxAmt <= 2000) {
+    return { type: PLAN.UNLIMITED, orderId: order.id || order.number || order.order_number, expireAt: endOfTodayTs() };
+  }
+  if (maxAmt >= 2500 && maxAmt <= 4000) {
+    return { type: PLAN.MONTHLY, orderId: order.id || order.number || order.order_number, expireAt: 0 };
+  }
+
   console.log("⚠️ プラン不明: マッチなし");
   return null;
 }
+
 
 // ========= LLM =========
 async function safeName(userId){
@@ -383,6 +434,7 @@ function reply(event, text){ return client.replyMessage(event.replyToken, { type
 // ===== 起動 =====
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
 
 
 
