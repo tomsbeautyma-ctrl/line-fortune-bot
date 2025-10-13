@@ -221,6 +221,7 @@ async function fetchStoresOrder(orderNumber) {
     const order = data?.orders?.find(o => String(o.number || o.order_number) === String(orderNumber)) || null;
     if (order) console.log("✅ 注文番号ヒット:", order.number || order.order_number || order.id);
     else console.log("❌ 注文が見つかりません:", orderNumber);
+    console.log("🧾 order keys:", Object.keys(order || {}));
     // デバッグ：主要フィールドを一度だけ確認したい時はコメント解除
     // console.log("🧾 受信した注文サマリ:", {
     //   number: order?.number, paid_status: order?.paid_status, payment_status: order?.payment_status,
@@ -388,4 +389,5 @@ function reply(event, text){ return client.replyMessage(event.replyToken, { type
 // ===== 起動 =====
 const port = process.env.PORT || 10000;
 app.listen(port, ()=>console.log(`Server running on ${port}`));
+
 
