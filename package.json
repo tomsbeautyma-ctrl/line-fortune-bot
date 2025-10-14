@@ -1,20 +1,4 @@
 {
-  "name": "line-fortune-bot",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "engines": { "node": ">=18" },
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "@line/bot-sdk": "^7.7.0",
-    "node-fetch": "^3.3.2",
-    "dayjs": "^1.11.11"
-  }
-}
-{
   "name": "beauty-one-linebot",
   "private": true,
   "type": "module",
@@ -28,4 +12,3 @@
     "express": "^4.19.2"
   }
 }
-
