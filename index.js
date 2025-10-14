@@ -63,19 +63,43 @@ app.get("/webhook", (_req, res) => res.status(200).send("OK"));
 // ------------------------------------------------------------
 // STORES: 注文取得 & 決済確認
 // ------------------------------------------------------------
-async function fetchStoresOrder(orderId) {
-  // 例: GET /v1/shops/{shop_id}/orders/{order_id}
-  const url = `${STORES_BASE}/v1/shops/${encodeURIComponent(
-    STORES_SHOP_ID
-  )}/orders/${encodeURIComponent(orderId)}`;
-  const { data } = await axios.get(url, {
-    headers: { Authorization: `Bearer ${STORES_API_KEY}`, "Content-Type": "application/json" },
-    timeout: 15000,
-  });
-  return data; // 期待: { status: 'paid'|'captured'|..., line_items: [...] }
+async function fetchStoresOrder(orderIdOrNumber) {
+  // STORESの仕様差異を吸収するフェイルオーバー実装
+  // 1) /v1/shops/{shop}/orders/{order_id}
+  // 2) /v1/shops/{shop}/orders?order_number={number}
+  // ※ shop は "beauty-one" のようなサブドメイン名を想定（httpsや.stores.jpは含めない）
+
+  const shop = encodeURIComponent(STORES_SHOP_ID);
+  const base = STORES_BASE;
+  const headers = { Authorization: `Bearer ${STORES_API_KEY}`, "Content-Type": "application/json" };
+
+  // まずは /orders/{id} を試す
+  const byIdUrl = `${base}/v1/shops/${shop}/orders/${encodeURIComponent(orderIdOrNumber)}`;
+  try {
+    const { data } = await axios.get(byIdUrl, { headers, timeout: 15000 });
+    return data;
+  } catch (e) {
+    const code = e?.response?.status;
+    if (code !== 404) throw e;
+  }
+
+  // 404 の場合は order_number 検索にフォールバック
+  const byNumberUrl = `${base}/v1/shops/${shop}/orders?order_number=${encodeURIComponent(orderIdOrNumber)}`;
+  const { data } = await axios.get(byNumberUrl, { headers, timeout: 15000 });
+  // 検索APIは配列で返る場合を想定
+  if (Array.isArray(data?.orders) && data.orders.length > 0) return data.orders[0];
+  if (Array.isArray(data) && data.length > 0) return data[0];
+  // 何も見つからず → 404相当のエラーを投げる
+  const err = new Error("Order not found");
+  err.status = 404;
+  err.endpointTried = { byIdUrl, byNumberUrl };
+  throw err;
 }
 
 async function verifyPayment(orderId) {
+  const order = await fetchStoresOrder(orderId);
+  return { ok: !!order && (order.status === "paid" || order.status === "captured"), order };
+}(orderId) {
   const order = await fetchStoresOrder(orderId);
   return { ok: !!order && (order.status === "paid" || order.status === "captured"), order };
 }
