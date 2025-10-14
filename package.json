@@ -12,3 +12,19 @@
     "express": "^4.19.2"
   }
 }
+{
+  "name": "beauty-one-linebot",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20 <25" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.28.4",
+    "axios": "^1.7.7",
+    "express": "^4.19.2"
+  }
+}
+
+
