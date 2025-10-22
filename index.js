@@ -1,241 +1,257 @@
-// ===== 1週間使い放題（¥1,650）専用・最小構成 =====
-// ・注文番号をLINEで送る → STORESで決済確認 → 7日パス付与
-// ・7日以内は質問し放題、期限後は購入案内
-// ・同一注文番号は最初に紐づけたLINEユーザーのみ使用可（共有防止）
-// ・環境変数は下の「設定一覧」を参照
-// --------------------------------------------------
+// index.js — STORES連携ナシ版：注文番号入力で「1週間チャット解放」
+// ------------------------------------------------------------
+// 概要:
+// ・ユーザーが「注文番号（アクセスコード）」を送ると、その瞬間から7日間チャット解放
+// ・STORES APIは一切使いません
+// ・Redisでエンタイトルメント（有効期限）とコード使用済み管理
+// ・安全運用のため 2モード対応：
+//    - CODE_MODE="free"   : 任意の注文番号（一定の正規表現を通過）で解放（手軽だが悪用注意）
+//    - CODE_MODE="signed" : 管理側が発行した署名つきコードのみ受付（推奨）
+// ・管理者用ミントAPI /mint 付き（CODE_MODE=signedのコードを発行）
+// ・LINE検証タイムアウト回避（即200）
+// ------------------------------------------------------------
 
 import express from "express";
 import crypto from "crypto";
 import axios from "axios";
 import { Redis } from "@upstash/redis";
 
-// ===== 環境変数 =====
+// ------------------------------------------------------------
+// 環境変数（名称ゆらぎに両対応）
+// ------------------------------------------------------------
 const {
   PORT = 3000,
-
+  // LINE
   LINE_CHANNEL_SECRET,
-  LINE_ACCESS_TOKEN,                  // LINE長期トークン
-
-  STORES_API_KEY,                     // 生キーのみ（Bearerは付けない！）
-  STORES_BEARER,                      // ↑未設定ならこちらでも可（どちらか1つ）
-  STORES_SHOP_ID,                     // 例: beauty-one（サブドメインだけ）
-  STORES_API_BASE = "https://api.stores.jp",
-  STORES_SHOP_URL,                    // 未購入案内に載せるURL（任意）
-
-  WEEKPASS_PRODUCT_ID,                // 1週間パス商品の product_id / sku / handle のいずれか
-
-  OPENAI_API_KEY,
-  MODEL = "gpt-4o-mini",
-
+  LINE_CHANNEL_ACCESS_TOKEN,
+  LINE_ACCESS_TOKEN, // 別名
+  // Upstash
   UPSTASH_REDIS_URL,
   UPSTASH_REDIS_TOKEN,
-
-  DEBUG                                // "1" で簡易デバッグログ
+  UPSTASH_REDIS_REST_URL,
+  UPSTASH_REDIS_REST_TOKEN,
+  // アクセス設定
+  ACCESS_DURATION_DAYS = "7", // 既定で7日
+  CODE_MODE = "signed", // "signed"（推奨） or "free"
+  ACCESS_CODE_SECRET, // CODE_MODE=signed時に必須（HMAC署名用）
+  REQUIRE_CODE_PREFIX = "", // 例: "ST" を指定すると ST から始まるコードのみ受付
+  // 管理用
+  ADMIN_TOKEN, // /mint に必要
 } = process.env;
 
-// ---- 便利: Bearerが誤って含まれても除去 ----
-const normBearer = v => (v || "").replace(/^Bearer\s+/i, "").trim();
-const STORES_TOKEN = normBearer(STORES_API_KEY || STORES_BEARER);
+const LINE_TOKEN = LINE_CHANNEL_ACCESS_TOKEN || LINE_ACCESS_TOKEN;
+const REDIS_URL = UPSTASH_REDIS_URL || UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = UPSTASH_REDIS_TOKEN || UPSTASH_REDIS_REST_TOKEN;
 
-// ---- チェック（起動は継続。ログのみ） ----
-if (!LINE_CHANNEL_SECRET || !LINE_ACCESS_TOKEN) console.error("[warn] LINE env 未設定");
-if (!STORES_TOKEN || !STORES_SHOP_ID) console.error("[warn] STORES env 未設定");
-if (!WEEKPASS_PRODUCT_ID) console.error("[warn] WEEKPASS_PRODUCT_ID 未設定");
-if (!UPSTASH_REDIS_URL || !UPSTASH_REDIS_TOKEN) console.error("[warn] Upstash env 未設定");
-if (!OPENAI_API_KEY) console.error("[warn] OPENAI_API_KEY 未設定");
+if (!LINE_CHANNEL_SECRET || !LINE_TOKEN) console.error("LINEの環境変数が未設定です");
+if (!REDIS_URL || !REDIS_TOKEN) console.error("Upstash Redisの環境変数が未設定です");
+if (CODE_MODE === "signed" && !ACCESS_CODE_SECRET) console.error("CODE_MODE=signed ですが ACCESS_CODE_SECRET が未設定です");
 
+const redis = new Redis({ url: REDIS_URL, token: REDIS_TOKEN });
 const app = express();
 app.use(express.json({ verify: (req, _res, buf) => (req.rawBody = buf) }));
-const redis = new Redis({ url: UPSTASH_REDIS_URL, token: UPSTASH_REDIS_TOKEN });
 
-// ===== 署名検証 =====
-function verifyLineSig(req) {
-  const sig = req.headers["x-line-signature"];
-  if (!sig) return false;
-  const mac = crypto.createHmac("SHA256", LINE_CHANNEL_SECRET);
-  mac.update(req.rawBody);
-  return sig === mac.digest("base64");
+// ------------------------------------------------------------
+// 署名検証（LINE）
+// ------------------------------------------------------------
+function validateLineSignature(req) {
+  const signature = req.headers["x-line-signature"];
+  if (!signature) return false;
+  const hmac = crypto.createHmac("SHA256", LINE_CHANNEL_SECRET);
+  hmac.update(req.rawBody);
+  return signature === hmac.digest("base64");
 }
 
-// ===== 便利関数 =====
-const entKey   = uid => `wk:ent:${uid}`;          // { orderId, expiresAt }
-const ownerKey = oid => `wk:owner:${oid}`;        // userId（共有防止）
-const guideKey = uid => `wk:guide:${uid}`;        // 未購入案内の連投抑止
+// ------------------------------------------------------------
+// Redis Keys
+// ------------------------------------------------------------
+const entitlementKey = (userId) => `entitlement:${userId}`; // { expiresAt, code }
+const usedCodeKey = (code) => `used_code:${code}`;          // 固定値 "true"
+
+// ------------------------------------------------------------
+// ユーティリティ
+// ------------------------------------------------------------
+const daysToMs = (d) => Number(d) * 24 * 60 * 60 * 1000;
 
 async function replyText(replyToken, text) {
   try {
-    await axios.post("https://api.line.me/v2/bot/message/reply",
+    await axios.post(
+      "https://api.line.me/v2/bot/message/reply",
       { replyToken, messages: [{ type: "text", text }] },
-      { headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` } }
+      { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
     );
   } catch (e) {
-    console.error("LINE返信エラー:", e?.response?.data || e.message);
+    console.error("LINE返信エラー", e?.response?.data || e.message);
   }
 }
 
-function guide() {
-  const url = STORES_SHOP_URL || "ショップ";
-  return [
-    "【ご利用案内】",
-    "このチャットはご購入者さま向けです。",
-    "1,650円で『1週間・質問し放題』。",
-    "ご購入後、STORESの注文番号（例: ST123456）をこのトークに送ってください。",
-    `ご購入はこちら：${url}`
-  ].join("\n");
+function formatJST(ts) {
+  const d = new Date(ts);
+  return d.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
 }
 
-function parseOrderId(text) {
-  const m = (text || "").match(/\b(?:認証|注文|order)?\s*(ST[\w-]+|\d{6,})\b/i);
-  return m ? m[1] : null;
+// ------------------------------------------------------------
+// コード検証ロジック
+// ------------------------------------------------------------
+// freeモード: 指定の前方一致（任意）とフォーマット（英数/ハイフン/先頭2文字以上）
+function looksLikeOrderCode(code) {
+  if (REQUIRE_CODE_PREFIX && !code.startsWith(REQUIRE_CODE_PREFIX)) return false;
+  return /^[A-Z0-9][A-Z0-9\-]{5,}$/i.test(code);
 }
 
-function paidStatus(order) {
-  const st = (order?.status || "").toLowerCase();
-  const ok = ["paid", "captured", "shipped", "fulfilled"].includes(st);
-  const ng = ["cancelled", "canceled", "refunded"].includes(st);
-  return ok && !ng;
+// signedモード: HMAC-SHA256 で署名された自己完結コード
+// 形式: PREFIX(optional)+base(ランダム) + ":" + sig
+// 表示コードは base + "-" + sigShort
+function signBase(base) {
+  const mac = crypto.createHmac("sha256", ACCESS_CODE_SECRET).update(base).digest("hex");
+  return mac; // 64hex
+}
+function verifySignedCode(code) {
+  // 表示形式: <prefix?><base>-<sig8>
+  const m = code.match(/^([A-Z0-9]+-)?([A-Z0-9]{8,})-([a-f0-9]{8})$/i);
+  if (!m) return false;
+  const base = m[2];
+  const sig8 = m[3].toLowerCase();
+  const mac = signBase(base).slice(0, 8);
+  return mac === sig8;
 }
 
-// ===== STORES: 注文取得（ID→番号の順に試す） =====
-async function fetchOrder(orderIdOrNumber) {
-  const shop = encodeURIComponent(STORES_SHOP_ID);
-  const headers = { Authorization: `Bearer ${STORES_TOKEN}` };
+// ------------------------------------------------------------
+// エンタイトルメント: 付与・照会
+// ------------------------------------------------------------
+async function grantEntitlement(userId, code) {
+  // コード使い回しを防ぐ: 既に使用済みか
+  const used = await redis.get(usedCodeKey(code));
+  if (used) return { ok: false, reason: "CODE_USED" };
 
-  const byIdUrl = `${STORES_API_BASE}/v1/shops/${shop}/orders/${encodeURIComponent(orderIdOrNumber)}`;
-  try {
-    DEBUG && console.log("[DEBUG] byId:", byIdUrl);
-    const { data } = await axios.get(byIdUrl, { headers, timeout: 15000 });
-    return data;
-  } catch (e) {
-    if (e?.response?.status !== 404) throw e;
-  }
+  const now = Date.now();
+  const expiresAt = now + daysToMs(ACCESS_DURATION_DAYS);
 
-  const byNumUrl = `${STORES_API_BASE}/v1/shops/${shop}/orders?order_number=${encodeURIComponent(orderIdOrNumber)}`;
-  DEBUG && console.log("[DEBUG] byNumber:", byNumUrl);
-  const { data } = await axios.get(byNumUrl, { headers, timeout: 15000 });
-  if (Array.isArray(data?.orders) && data.orders.length) return data.orders[0];
-  if (Array.isArray(data) && data.length) return data[0];
-
-  const err = new Error("Order not found");
-  err.status = 404;
-  throw err;
+  const ent = { code, grantedAt: now, expiresAt };
+  await redis.set(entitlementKey(userId), ent, { ex: Math.ceil((expiresAt - now) / 1000) + 60 });
+  await redis.set(usedCodeKey(code), "true", { ex: Math.ceil((expiresAt - now) / 1000) + 60 });
+  return { ok: true, ent };
 }
 
-function isWeekPass(order) {
-  const items = order?.line_items || [];
-  const ids = items.map(li => li.product_id || li.sku || li.handle).filter(Boolean);
-  return ids.includes(WEEKPASS_PRODUCT_ID);
+async function getEntitlement(userId) {
+  return await redis.get(entitlementKey(userId));
 }
 
-// ===== ルーティング =====
-app.get("/health", (_q, r) => r.json({ ok: true }));
-app.get("/webhook", (_q, r) => r.send("OK"));
-
+// ------------------------------------------------------------
+// Webhook（即200 → 非同期処理）
+// ------------------------------------------------------------
 app.post("/webhook", async (req, res) => {
-  res.status(200).end(); // LINEのタイムアウト回避
-
+  res.status(200).end();
   try {
-    if (req.headers["x-line-signature"] && !verifyLineSig(req)) {
-      console.warn("Invalid LINE signature"); return;
+    const hasSig = !!req.headers["x-line-signature"];
+    if (hasSig && !validateLineSignature(req)) {
+      console.warn("Invalid LINE signature");
+      return;
     }
+
     const events = req.body?.events || [];
     for (const ev of events) {
-      if (ev.type !== "message" || ev.message?.type !== "text") continue;
+      if (ev.type !== "message" || ev.message.type !== "text") continue;
 
-      const userId = ev.source?.userId;
       const replyToken = ev.replyToken;
-      const text = (ev.message?.text || "").trim();
+      const userId = ev.source?.userId;
+      const text = (ev.message.text || "").trim();
 
-      const orderId = parseOrderId(text);
-      if (orderId) {
-        await handleRegister(replyToken, userId, orderId);
-      } else {
-        await handleQuestion(replyToken, userId, text);
+      // コマンド系
+      if (/^status$/i.test(text)) {
+        const ent = await getEntitlement(userId);
+        if (!ent) {
+          await replyText(replyToken, "現在ご利用中の権利はありません。注文番号（アクセスコード）を送って開始してください。");
+        } else {
+          await replyText(
+            replyToken,
+            `ご利用は ${formatJST(ent.expiresAt)} まで有効です。\nコード: ${ent.code}`
+          );
+        }
+        continue;
       }
+
+      // まだ権利が無ければ、コードとして扱う
+      const ent = await getEntitlement(userId);
+      if (!ent) {
+        const code = text.replace(/\s+/g, "");
+        const accept = CODE_MODE === "signed" ? verifySignedCode(code) : looksLikeOrderCode(code);
+        if (!accept) {
+          const modeHint = CODE_MODE === "signed" ? "有効なアクセスコード形式ではありません。" : "注文番号の形式ではありません。";
+          await replyText(
+            replyToken,
+            `${modeHint}\n・例（signed）: ABCD1234-1a2b3c4d\n・例（free）: ${REQUIRE_CODE_PREFIX || "任意の英数字先頭"}123456`
+          );
+          continue;
+        }
+
+        const granted = await grantEntitlement(userId, code);
+        if (!granted.ok) {
+          await replyText(replyToken, "このコードは既に使用されています。別のコードをご利用ください。");
+          continue;
+        }
+
+        await replyText(
+          replyToken,
+          `アクセスを開始しました。\n有効期間: ${ACCESS_DURATION_DAYS}日間\n終了日時: ${formatJST(granted.ent.expiresAt)}\n\nご質問を送ってください。`
+        );
+        continue;
+      }
+
+      // 権利がある → 期限内か判定
+      if (Date.now() > ent.expiresAt) {
+        await replyText(replyToken, "有効期限が切れています。新しいコードを送信して再開してください。");
+        continue;
+      }
+
+      // ここで本来の鑑定/応答処理
+      const answer = await generateAnswer(text);
+      await replyText(replyToken, answer);
     }
   } catch (e) {
-    console.error("Webhook処理エラー:", e);
+    console.error("Webhook処理エラー", e);
   }
 });
 
-// ===== 認証（注文番号 → 7日権利） =====
-async function handleRegister(replyToken, userId, orderId) {
+// ------------------------------------------------------------
+// 管理者: 署名つきコード発行API（CODE_MODE=signed向け）
+// 例) POST /mint { count: 5, prefix: "ST" }
+//     Authorization: Bearer <ADMIN_TOKEN>
+// ------------------------------------------------------------
+app.post("/mint", async (req, res) => {
   try {
-    const order = await fetchOrder(orderId);
+    const auth = req.headers.authorization || "";
+    if (!ADMIN_TOKEN || auth !== `Bearer ${ADMIN_TOKEN}`) return res.status(401).json({ error: "unauthorized" });
 
-    if (!paidStatus(order)) {
-      await replyText(replyToken, "未決済またはキャンセルのため承認できません。決済完了後にお試しください。");
-      return;
+    const { count = 1, prefix = REQUIRE_CODE_PREFIX || "" } = req.body || {};
+    if (CODE_MODE !== "signed") return res.status(400).json({ error: "CODE_MODE is not 'signed'" });
+    if (!ACCESS_CODE_SECRET) return res.status(500).json({ error: "ACCESS_CODE_SECRET not set" });
+
+    const out = [];
+    for (let i = 0; i < Math.max(1, Math.min(1000, Number(count) || 1)); i++) {
+      const base = crypto.randomBytes(6).toString("hex"); // 12hex
+      const sig8 = signBase(base).slice(0, 8);
+      const code = `${prefix ? prefix + "-" : ""}${base.toUpperCase()}-${sig8}`;
+      out.push(code);
     }
-    if (!isWeekPass(order)) {
-      await replyText(replyToken, "この注文は『1週間使い放題』商品のご購入ではありません。ご確認ください。");
-      return;
-    }
-
-    // 共有防止：既に別ユーザーがこの注文を使っていないか
-    const owner = await redis.get(ownerKey(orderId));
-    if (owner && owner !== userId) {
-      await replyText(replyToken, "この注文番号は別のLINEアカウントに登録済みです。");
-      return;
-    }
-
-    const sevenDays = 7 * 24 * 60 * 60 * 1000;
-    const ent = { orderId, grantedAt: Date.now(), expiresAt: Date.now() + sevenDays };
-
-    await redis.set(entKey(userId), ent, { ex: 60 * 60 * 24 * 90 });
-    await redis.set(ownerKey(orderId), userId, { ex: 60 * 60 * 24 * 90 });
-
-    const endAt = new Date(ent.expiresAt).toLocaleString("ja-JP", { hour12: false });
-    await replyText(replyToken, `注文番号(${orderId})を確認しました。\n『1週間・質問し放題』を付与しました。\n有効期限：${endAt}\n\nご質問をどうぞ。`);
+    res.json({ codes: out, mode: CODE_MODE, days: Number(ACCESS_DURATION_DAYS) });
   } catch (e) {
-    console.error("認証エラー:", e?.response?.data || e.message);
-    await replyText(replyToken, "注文確認でエラーが発生しました。時間をおいて再度お試しください。");
+    res.status(500).json({ error: e.message });
   }
-}
+});
 
-// ===== 質問（権利チェック → 回答） =====
-async function handleQuestion(replyToken, userId, question) {
-  const ent = await redis.get(entKey(userId));
-  if (!ent) {
-    const guided = await redis.get(guideKey(userId));
-    if (!guided) {
-      await replyText(replyToken, guide());
-      await redis.set(guideKey(userId), "1", { ex: 60 * 15 }); // 15分に1回だけ案内
-    }
-    return;
-  }
-  if (Date.now() > ent.expiresAt) {
-    await replyText(replyToken, "有効期限が切れました。再度ご購入ください。\n\n" + guide());
-    return;
-  }
+// ------------------------------------------------------------
+// ヘルスチェック/検証用
+// ------------------------------------------------------------
+app.get("/health", (_req, res) => res.json({ ok: true, mode: CODE_MODE, days: Number(ACCESS_DURATION_DAYS) }));
+app.get("/webhook", (_req, res) => res.status(200).send("OK"));
 
-  const answer = await generateAnswer(question);
-  await replyText(replyToken, answer);
-}
-
-// ===== OpenAI（簡易） =====
+// ------------------------------------------------------------
+// 応答ダミー（本番では占いロジック等に差し替え）
+// ------------------------------------------------------------
 async function generateAnswer(q) {
-  try {
-    const resp = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: MODEL,
-        messages: [
-          { role: "system", content: "あなたは優しい占い師です。専門用語は使わず、要点を短く前向きに答え、最後は一言で背中を押してください。" },
-          { role: "user", content: `相談内容: ${q}` }
-        ],
-        temperature: 0.7,
-      },
-      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 20000 }
-    );
-    const txt = resp.data?.choices?.[0]?.message?.content?.trim();
-    if (txt) return `【占い結果】\n${txt}`;
-  } catch (e) {
-    console.error("OpenAIエラー:", e?.response?.data || e.message);
-  }
-  return `【占い結果】\nご相談: ${q}\n\nまずは一呼吸。小さな一歩が流れを変えます。`;
+  return `【回答】\nご質問: ${q}\n\n今は焦らず、できる一歩から。1週間いつでもご相談ください。`;
 }
 
-// ===== 起動 =====
+// ------------------------------------------------------------
 app.listen(PORT, () => console.log(`LISTEN: http://0.0.0.0:${PORT}`));
